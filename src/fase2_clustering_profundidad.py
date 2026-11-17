@@ -1,29 +1,30 @@
 """
-Fase 2: K-Means sobre superpíxeles + mapa de profundidad.
+Fase 2: K-Means sobre superpíxeles + Motor Universal de Profundidad 100% Offline.
 
-Convención del mapa Z (igual que tu versión original): valores en [0, 1], 1 = CERCA, 0 = LEJOS.
-En realidad es una disparidad normalizada; la fase 3 la convierte a profundidad métrica con
-un modelo de cámara pinhole.
-
-Dos modos:
-  - "neural":     MiDaS aporta la profundidad relativa; aquí se corrige y regulariza con
-                  (a) modelo de suelo en perspectiva (si hay punto de fuga fiable),
-                  (b) cielo al infinito, (c) planos por superpíxel, (d) filtro guiado.
-  - "geometrico": tu heurística original (horizonte + color + textura), corregida y vectorizada.
-                  Se usa si no hay modelo neuronal disponible.
+Adapta automáticamente el modelo de profundidad según la naturaleza de la imagen:
+  1. Objetos aislados (autos, frutas, vehículos, figuras, productos):
+     Combina perfil volumétrico convexo + orientación/perspectiva del objeto (punto más bajo en el
+     suelo está más cerca de la cámara) + facetas estructurales por K-Means (parabrisas, capó,
+     puertas, ruedas) + relieve fotométrico libre de picos especulares.
+  2. Arquitectura / Casas / Edificios:
+     Combina plano de terreno en perspectiva + extrusión vertical de fachadas y muros anclados a su
+     base en el suelo + separación de techos y cielo + regularización planar por superpíxeles.
+  3. Paisajes / Naturaleza / Calles abiertas:
+     Combina perspectiva atmosférica (neblina/desaturación lejana), horizonte adaptativo, gradiente
+     de nitidez/textura (defocus), propagación raíz->copa para árboles/montañas y cielo al infinito.
 """
 import cv2
 import numpy as np
 from scipy import ndimage as ndi
 from sklearn.cluster import KMeans
-from sklearn.metrics import silhouette_score, davies_bouldin_score
+from sklearn.metrics import davies_bouldin_score, silhouette_score
 
 
 # --------------------------------------------------------------------------------------
-# Utilidades
+# Utilidades de filtrado y regularización
 # --------------------------------------------------------------------------------------
 def filtro_guiado_rapido(guia_rgb: np.ndarray, mapa_z: np.ndarray, radio: int = 6,
-                         eps: float = 4e-4) -> np.ndarray:
+                          eps: float = 4e-4) -> np.ndarray:
     """Filtro guiado (He et al.) con la imagen como guía: alinea los bordes de Z con los de la foto."""
     I = cv2.cvtColor(guia_rgb, cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
     p = mapa_z.astype(np.float32)
@@ -43,11 +44,10 @@ def _normalizar(mapa: np.ndarray, p_lo: float = 1, p_hi: float = 99) -> np.ndarr
 
 
 def _ajuste_planos_por_superpixel(d: np.ndarray, slic_map: np.ndarray,
-                                  ridge: float = 2e-5, max_pend: float = 3.0) -> np.ndarray:
+                                  ridge: float = 2e-5, max_pend: float = 2.5) -> np.ndarray:
     """
-    Ajusta un plano  d ≈ c + a·(x-mx) + b·(y-my)  dentro de cada superpíxel (idea de Make3D).
-    Resultado: superficies inclinadas suaves en vez de "escalones" planos por parche.
-    Totalmente vectorizado (antes había un bucle con np.percentile por superpíxel: muy lento).
+    Ajusta un plano d ≈ c + a·(x-mx) + b·(y-my) dentro de cada superpíxel (Make3D).
+    Ideal para facetas de vehículos, paredes de casas y laderas de paisajes.
     """
     H, W = d.shape
     n_sp = int(slic_map.max()) + 1
@@ -58,8 +58,8 @@ def _ajuste_planos_por_superpixel(d: np.ndarray, slic_map: np.ndarray,
     v = d.ravel().astype(np.float64)
     cnt = np.bincount(lab, minlength=n_sp).astype(np.float64) + 1e-9
 
-    def S(a):
-        return np.bincount(lab, weights=a, minlength=n_sp) / cnt
+    def S(arr):
+        return np.bincount(lab, weights=arr, minlength=n_sp) / cnt
 
     mx, my, mv = S(x), S(y), S(v)
     sxx, syy, sxy = S(x * x) - mx ** 2, S(y * y) - my ** 2, S(x * y) - mx * my
@@ -72,29 +72,17 @@ def _ajuste_planos_por_superpixel(d: np.ndarray, slic_map: np.ndarray,
     idx = np.arange(n_sp)
     vmin = ndi.minimum(d, slic_map, idx)
     vmax = ndi.maximum(d, slic_map, idx)
-    plano = np.clip(plano, vmin[lab], vmax[lab])       # el plano nunca se sale del rango observado
+    plano = np.clip(plano, vmin[lab], vmax[lab])
     return plano.reshape(H, W).astype(np.float32)
 
 
 def _prior_suelo(H: int, W: int, y_horizonte: float) -> np.ndarray:
-    """
-    Disparidad de un suelo plano visto en perspectiva.
-    Con cámara a altura h: Z = f·h / (y - y_h)  =>  disparidad 1/Z ∝ (y - y_h): LINEAL en y.
-    (La versión anterior usaba una potencia 1.10 sobre Z, que no corresponde a ninguna geometría.)
-    """
     y = (np.arange(H, dtype=np.float32) / H).reshape(H, 1)
     g = np.clip((y - y_horizonte) / (1.0 - y_horizonte + 1e-6), 0.0, 1.0)
     return np.repeat(g, W, axis=1)
 
 
 def _anclar_verticales_al_suelo(d, es_suelo, es_cielo, peso_vertical):
-    """
-    Un objeto vertical (tronco, poste, pared, persona) tiene la profundidad del punto donde
-    TOCA EL SUELO. Para cada píxel buscamos el píxel de suelo más cercano hacia abajo en su
-    columna y, si la red lo situó más cerca que esa base (copas que "se vienen encima"),
-    se tira de él hacia la profundidad de la base. Es la idea raíz->copa de la versión original,
-    pero con un barrido vectorizado en vez de dilataciones iterativas.
-    """
     H, W = d.shape
     base = np.full(W, np.nan, dtype=np.float32)
     d_base = np.full((H, W), np.nan, dtype=np.float32)
@@ -109,7 +97,6 @@ def _anclar_verticales_al_suelo(d, es_suelo, es_cielo, peso_vertical):
 
 
 def _ajuste_robusto(x: np.ndarray, y: np.ndarray, iters: int = 4):
-    """Recta y ≈ a·x + b con descarte iterativo de atípicos (MAD)."""
     mask = np.ones_like(x, dtype=bool)
     a, b = 1.0, 0.0
     for _ in range(iters):
@@ -122,21 +109,15 @@ def _ajuste_robusto(x: np.ndarray, y: np.ndarray, iters: int = 4):
     return float(a), float(b), float(mask.mean())
 
 
-# --------------------------------------------------------------------------------------
-# Detección de cielo (común a ambos modos)
-# --------------------------------------------------------------------------------------
 def _mascara_cielo(img_lab, enfoque, y_norm, y_horizonte, disp=None):
     L = img_lab[:, :, 0] / 255.0
     b_c = img_lab[:, :, 2] - 128.0
     a_c = img_lab[:, :, 1] - 128.0
-    color = (L > 0.52) & (b_c < 12.0) & (a_c > -12.0) & (enfoque < 0.38) & (y_norm < y_horizonte + 0.03)
-    montana = ((y_norm < y_horizonte + 0.03) & (y_norm > y_horizonte - 0.12) &
-               (L < 0.55) & (b_c < 8.0) & (enfoque < 0.25))
-    cielo = color | montana
-    if disp is not None:   # con red neuronal exigimos además que sea "lejano"
+    # Cielo claro (azul, celeste o nublado uniforme en la parte superior)
+    cielo = (L > 0.54) & (b_c < 10.0) & (a_c > -12.0) & (enfoque < 0.30) & (y_norm < y_horizonte + 0.06)
+    if disp is not None:
         cielo &= disp < np.percentile(disp, 35)
     cielo = cv2.morphologyEx(cielo.astype(np.uint8), cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
-    # conserva solo regiones grandes (descarta "cielo" falso dentro de objetos)
     n, comp, stats, _ = cv2.connectedComponentsWithStats(cielo, connectivity=8)
     grande = np.zeros(n, dtype=bool)
     grande[1:] = stats[1:, cv2.CC_STAT_AREA] > 0.01 * cielo.size
@@ -144,103 +125,233 @@ def _mascara_cielo(img_lab, enfoque, y_norm, y_horizonte, disp=None):
 
 
 # --------------------------------------------------------------------------------------
-# Modo geométrico (heurística original mejorada + relieve volumétrico orgánico)
+# 1. Profundidad para Objetos Aislados (Autos, Frutas, Casas recortadas, Productos)
 # --------------------------------------------------------------------------------------
-def _profundidad_volumetrica_objeto(img_lab: np.ndarray, enfoque: np.ndarray, mascara_fg: np.ndarray) -> np.ndarray:
+def _profundidad_volumetrica_objeto(
+    img_rgb: np.ndarray,
+    img_lab: np.ndarray,
+    enfoque: np.ndarray,
+    grad_map: np.ndarray,
+    mascara_fg: np.ndarray,
+    mapa_clusters: np.ndarray,
+) -> np.ndarray:
     """
-    Genera un perfil de profundidad suave y convexo tipo cúpula/esfera para un objeto segmentado,
-    modulando con el sombreado (luminancia), saturación y detalle local para que la superficie
-    no tenga cortes de horizonte ni escalones artificiales.
+    Reconstruye el volumen 3D de cualquier objeto aislado (orgánico como una fruta o
+    estructurado/geométrico como un automóvil, casa o mueble):
+      - Transformada de distancia multi-escala (cúpula elipsoidal suave + cresta estructural).
+      - Inclinación de perspectiva vertical/horizontal a partir del contorno inferior del objeto
+        (en autos o casas vistas en 3/4, la esquina más baja en la foto es el parachoques/esquina
+        más cercana a la cámara).
+      - Coherencia por facetas K-Means (capó, parabrisas, ventanas laterales, puertas).
+      - Sombreado suave (Shape-from-Shading) con supresión de brillos especulares.
     """
+    H, W = mascara_fg.shape
     m_u8 = mascara_fg.astype(np.uint8)
     dist = cv2.distanceTransform(m_u8, cv2.DIST_L2, 5).astype(np.float32)
     max_d = float(dist.max())
     if max_d < 1e-3:
         return np.zeros_like(enfoque, dtype=np.float32)
 
-    # Perfil elipsoidal: z = sqrt(1 - (1 - r)^2) = sqrt(2r - r^2), suave hasta el borde
+    # A. Base volumétrica suave (perfil elipsoidal que llega limpio al contorno)
     r = np.clip(dist / max_d, 0.0, 1.0)
-    domo = np.sqrt(np.clip(2.0 * r - r * r, 0.0, 1.0))
-    domo = cv2.GaussianBlur(domo, (0, 0), sigmaX=max(2.0, max_d * 0.08))
-    if domo[mascara_fg].max() > 1e-6:
-        domo = domo / float(domo[mascara_fg].max())
+    domo_eliptico = np.sqrt(np.clip(2.0 * r - r * r, 0.0, 1.0))
+    domo_suave = cv2.GaussianBlur(domo_eliptico, (0, 0), sigmaX=max(3.0, max_d * 0.12))
+    if domo_suave[mascara_fg].max() > 1e-6:
+        domo_suave /= float(domo_suave[mascara_fg].max())
 
-    # Sombreado suave (Shape-from-Shading ligero)
+    # B. Rampa de perspectiva 3D desde la huella inferior del objeto
+    # En cualquier objeto apoyado (auto, casa, mueble), la parte más baja de cada columna
+    # indica qué tan cerca está esa sección respecto al observador.
+    ys_fg, xs_fg = np.where(mascara_fg)
+    y_min, y_max = int(ys_fg.min()), int(ys_fg.max())
+    x_min, x_max = int(xs_fg.min()), int(xs_fg.max())
+    alto_obj = max(y_max - y_min, 1)
+    ancho_obj = max(x_max - x_min, 1)
+
+    # Encontrar el borde inferior del objeto por columna y suavizarlo
+    hay_col = mascara_fg.any(axis=0)
+    fila_inf_col = H - 1 - np.argmax(mascara_fg[::-1, :], axis=0)
+    cols_validas = np.where(hay_col)[0]
+    if len(cols_validas) > 5:
+        y_base_col = np.interp(
+            np.arange(W),
+            cols_validas,
+            fila_inf_col[cols_validas].astype(np.float32),
+        )
+        y_base_col = cv2.GaussianBlur(y_base_col.reshape(1, W), (1, 31), 0).ravel()
+        # Normalizar entre 0 y 1 según qué parte de la base baja más en la foto (más cerca)
+        b_min, b_max = float(y_base_col[cols_validas].min()), float(y_base_col[cols_validas].max())
+        if b_max - b_min > 0.08 * alto_obj:
+            persp_x = np.clip((y_base_col - b_min) / (b_max - b_min + 1e-6), 0.0, 1.0)
+        else:
+            persp_x = np.full(W, 0.5, dtype=np.float32)
+    else:
+        persp_x = np.full(W, 0.5, dtype=np.float32)
+
+    grid_y, _ = np.mgrid[0:H, 0:W]
+    rel_y = np.clip((grid_y - y_min) / float(alto_obj), 0.0, 1.0)
+    # La parte inferior-frontal del objeto sobresale ligeramente más que el techo trasero
+    rampa_perspectiva = 0.55 * persp_x[None, :] + 0.45 * (1.0 - 0.35 * (1.0 - rel_y))
+    rampa_perspectiva = cv2.GaussianBlur(rampa_perspectiva.astype(np.float32), (15, 15), 0)
+
+    # C. Relieve por facetas K-Means y luminancia sin distorsión por reflejos o vidrios oscuros
     L = img_lab[:, :, 0] / 255.0
-    L_suave = cv2.GaussianBlur(L.astype(np.float32), (9, 9), 0)
-    # Descontar brillos especulares puntuales muy intensos para que no creen picos puntiagudos
-    especular = np.clip((L - 0.85) / 0.15, 0.0, 1.0)
-    sombreado = L_suave * (1.0 - 0.35 * especular) + 0.15 * enfoque
+    # Atenuar reflejos especulares blancos y no hundir superficies oscuras (como vidrios polarizados o llantas)
+    L_templada = np.clip(L, 0.25, 0.82)
+    L_templada = (L_templada - 0.25) / 0.57
+    L_suave = cv2.GaussianBlur(L_templada.astype(np.float32), (11, 11), 0)
 
-    # Combinar domo geométrico (82%) + relieve fotométrico (18%)
-    z = np.zeros_like(domo, dtype=np.float32)
-    z_interno = 0.25 + 0.62 * domo + 0.13 * sombreado
-    z[mascara_fg] = np.clip(z_interno[mascara_fg], 0.15, 1.0)
+    # Promedio por cluster dentro del objeto para dar estructura de paneles (capó, puertas, hojas)
+    n_k = int(mapa_clusters.max()) + 1
+    z_base_combinada = 0.68 * domo_suave + 0.22 * rampa_perspectiva + 0.10 * L_suave
+    cnt_k = np.bincount(mapa_clusters[mascara_fg].ravel(), minlength=n_k).astype(np.float64) + 1e-9
+    sum_k = np.bincount(
+        mapa_clusters[mascara_fg].ravel(),
+        weights=z_base_combinada[mascara_fg].ravel().astype(np.float64),
+        minlength=n_k,
+    )
+    media_k = (sum_k / cnt_k).astype(np.float32)
+    mapa_facetas = cv2.GaussianBlur(media_k[mapa_clusters], (9, 9), 0)
+
+    # Combinar volumen global (75%) + estructura de facetas (15%) + micro-detalle (10%)
+    detalle = 0.6 * L_suave + 0.4 * cv2.GaussianBlur(enfoque, (7, 7), 0)
+    z_interno = (0.72 * z_base_combinada + 0.18 * mapa_facetas + 0.10 * detalle) * np.sqrt(
+        np.clip(domo_eliptico * 1.15, 0.0, 1.0)
+    )
+
+    z = np.zeros((H, W), dtype=np.float32)
+    z[mascara_fg] = np.clip(0.20 + 0.80 * z_interno[mascara_fg], 0.18, 1.0)
     return z
 
 
-def _profundidad_geometrica(img_lab, enfoque, y_norm, x_norm, y_horizonte, x_vp, es_cielo,
-                            vp_confianza: float = 1.0, mascara_fg: np.ndarray | None = None):
-    if mascara_fg is not None:
-        return _profundidad_volumetrica_objeto(img_lab, enfoque, mascara_fg)
-
+# --------------------------------------------------------------------------------------
+# 2. Profundidad para Escenas Completas: Paisajes, Casas, Calles y Vehículos en Escena
+# --------------------------------------------------------------------------------------
+def _profundidad_escena_universal(
+    img_rgb: np.ndarray,
+    img_lab: np.ndarray,
+    enfoque: np.ndarray,
+    grad_map: np.ndarray,
+    y_norm: np.ndarray,
+    x_norm: np.ndarray,
+    y_horizonte: float,
+    x_vp: float,
+    es_cielo: np.ndarray,
+    vp_confianza: float,
+    tipo_escena: str,
+    mascara_sujeto: np.ndarray | None = None,
+) -> np.ndarray:
+    """
+    Motor de profundidad monocular multi-pista para paisajes, arquitectura/casas y escenas exteriores:
+      1. Pista de perspectiva atmosférica / Dark Channel (objetos lejanos pierden contraste y se vuelven
+         más azulados/claros por dispersión atmosférica).
+      2. Pista de geometría de suelo + cono hacia el punto de fuga (carreteras, valles, calles).
+      3. Pista de nitidez y gradiente local (texturas cercanas tienen mayor frecuencia espacial).
+      4. Anclaje vertical raíz->techo/copa para casas, edificios, árboles y postes.
+      5. Realce volumétrico del sujeto principal (si hay un auto o casa protagonista en la escena).
+    """
     H, W = y_norm.shape
     L = img_lab[:, :, 0] / 255.0
     a_c = img_lab[:, :, 1] - 128.0
     b_c = img_lab[:, :, 2] - 128.0
 
-    # Si la confianza del punto de fuga es baja (ej. primer plano de un objeto, retrato o mesa),
-    # combinamos una estimación de saliencia/objeto central con un gradiente de soporte suave,
-    # evitando el corte duro en y_horizonte que partía los objetos por la mitad.
-    if vp_confianza < 0.25:
-        from fase1_slic import segmentar_objeto_sin_fondo
-        img_bgr_aprox = cv2.cvtColor(img_lab.astype(np.uint8), cv2.COLOR_Lab2BGR)
-        fg_auto = segmentar_objeto_sin_fondo(img_bgr_aprox)
-        ratio_fg = float(fg_auto.mean())
-        if 0.04 < ratio_fg < 0.85:
-            z_obj = _profundidad_volumetrica_objeto(img_lab, enfoque, fg_auto)
-            # Fondo con gradiente vertical muy suave detrás del objeto
-            z_bg = 0.05 + 0.22 * np.clip(y_norm, 0.0, 1.0)
-            z_bg[es_cielo] = 0.0
-            z = np.where(fg_auto, np.maximum(z_obj, z_bg + 0.12), z_bg)
-            return cv2.GaussianBlur(z.astype(np.float32), (5, 5), 0)
+    # --- Pista 1: Perspectiva atmosférica (Haze / Dark Channel Prior) ---
+    # En paisajes, las montañas y fondos lejanos tienen alto brillo mínimo en RGB y menor saturación
+    img_f = img_rgb.astype(np.float32) / 255.0
+    canal_oscuro = np.min(img_f, axis=2)
+    canal_oscuro = cv2.erode(canal_oscuro, np.ones((7, 7), np.uint8))
+    cercania_atmosferica = 1.0 - cv2.GaussianBlur(canal_oscuro, (15, 15), 0)
+    # Tonos cálidos (rojos/amarillos/verdes saturados) suelen estar más cerca que tonos azulados/grisáceos
+    calidez = np.clip((b_c - a_c * 0.3 + 20.0) / 60.0, 0.0, 1.0)
+    pista_atmosfera = np.clip(0.70 * cercania_atmosferica + 0.30 * calidez, 0.0, 1.0)
 
-    arriba_no_cielo = (y_norm < y_horizonte + 0.02) & (~es_cielo)
+    # --- Pista 2: Geometría del plano de tierra y perspectiva hacia el punto de fuga ---
+    # Si hay cielo detectado, ajustamos el horizonte real al límite inferior del cielo
+    if es_cielo.any():
+        filas_cielo = np.where(es_cielo.mean(axis=1) > 0.25)[0]
+        if len(filas_cielo) > 0:
+            y_h_efectivo = float(np.clip(filas_cielo.max() / float(H), 0.15, 0.65))
+        else:
+            y_h_efectivo = y_horizonte
+    else:
+        y_h_efectivo = y_horizonte
+
+    z_suelo = _prior_suelo(H, W, y_h_efectivo - 0.03)
+    # Añadir leve curvatura lateral hacia el punto de fuga cuando hay perspectiva vial/arquitectónica
+    efecto_vp = np.abs(x_norm - x_vp) * (1.0 - y_norm) * (0.25 if vp_confianza > 0.25 else 0.10)
+    z_perspectiva = np.clip(z_suelo * 0.90 + efecto_vp + 0.06, 0.04, 1.0)
+
+    # Por encima del horizonte pero que NO es cielo (montañas, cordilleras, edificios lejanos, árboles):
+    # la profundidad decrece suavemente desde la base en el horizonte hacia las cumbres
+    sobre_horiz = (y_norm <= y_h_efectivo) & (~es_cielo)
+    dist_sobre_h = np.clip((y_h_efectivo - y_norm) / max(y_h_efectivo, 0.15), 0.0, 1.0)
+    z_montanas = np.clip(0.28 * (1.0 - 0.65 * dist_sobre_h) + 0.25 * pista_atmosfera, 0.06, 0.55)
+    z_base_escena = np.where(sobre_horiz, z_montanas, z_perspectiva)
+
+    # --- Pista 3: Detección y anclaje de estructuras verticales (Casas, Autos, Árboles) ---
     gx = cv2.Sobel(L.astype(np.float32), cv2.CV_32F, 1, 0, ksize=3)
     borde_v = np.abs(gx) / (np.percentile(np.abs(gx), 98) + 1e-6)
-    abajo_obj = (y_norm >= y_horizonte - 0.02) & (y_norm < 0.88) & (
-        (L < 0.34) | ((enfoque > 0.32) & (borde_v > 0.28)) |
-        ((a_c < -10.0) & (enfoque > 0.28) & (np.abs(x_norm - x_vp) > 0.12)))
-    es_vertical = arriba_no_cielo | abajo_obj
-    cerrado = cv2.morphologyEx(es_vertical.astype(np.uint8), cv2.MORPH_CLOSE,
-                               cv2.getStructuringElement(cv2.MORPH_RECT, (7, 15))) > 0
-    es_vertical = cerrado & (~es_cielo)
+    contraste_local = cv2.GaussianBlur(grad_map, (9, 9), 0)
 
-    z_suelo = _prior_suelo(H, W, y_horizonte - 0.02)
-    z_suelo = np.clip(z_suelo * 0.94 + 0.06, 0.06, 1.0)
+    es_estructura = (~es_cielo) & (
+        ((y_norm < y_h_efectivo + 0.03) & (pista_atmosfera > 0.42)) |
+        ((y_norm >= y_h_efectivo - 0.02) & (y_norm < 0.92) & (
+            (enfoque > 0.28) & (borde_v > 0.24) |
+            (contraste_local > 0.26) |
+            ((a_c < -8.0) & (enfoque > 0.22))
+        ))
+    )
+    es_estructura = cv2.morphologyEx(
+        es_estructura.astype(np.uint8), cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (9, 17))
+    ) > 0
+    es_estructura &= (~es_cielo)
 
-    # Raíz -> copa, vectorizado: fila más baja de objeto vertical en cada columna
-    base_valida = es_vertical & (y_norm >= y_horizonte - 0.01)
-    hay = base_valida.any(axis=0)
+    # Propagar la profundidad de la base donde la estructura toca el suelo hacia arriba (paredes planas en Z)
+    base_valida = es_estructura & (y_norm >= y_h_efectivo - 0.02)
+    hay_base = base_valida.any(axis=0)
     fila_base = H - 1 - np.argmax(base_valida[::-1, :], axis=0)
-    z_raiz_col = np.where(hay, z_suelo[fila_base, np.arange(W)], 0.0).astype(np.float32)
-    z_obj = np.where(es_vertical, z_raiz_col[None, :], 0.0).astype(np.float32)
+    z_raiz_col = np.where(hay_base, z_perspectiva[fila_base, np.arange(W)], z_base_escena.mean(axis=0)).astype(np.float32)
+    # Suavizar horizontalmente la base para que las fachadas de casas no tengan estrías verticales
+    z_raiz_col = cv2.GaussianBlur(z_raiz_col.reshape(1, W), (1, 21), 0).ravel()
+    z_estruct = np.where(es_estructura, z_raiz_col[None, :], 0.0).astype(np.float32)
 
     kern = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
-    z_prop = z_obj.copy()
-    for _ in range(18):
+    z_prop = z_estruct.copy()
+    for _ in range(12):
         z_dil = cv2.dilate(z_prop, kern)
-        z_prop = np.where(es_vertical, np.maximum(z_prop, z_dil * 0.992), 0.0)
+        z_prop = np.where(es_estructura, np.maximum(z_prop, z_dil * 0.994), 0.0)
 
-    z = z_suelo.copy()
+    # Combinar terreno/montañas con estructuras verticales y pista atmosférica
+    z = 0.65 * z_base_escena + 0.25 * pista_atmosfera + 0.10 * cv2.GaussianBlur(enfoque, (11, 11), 0)
+    if es_estructura.any():
+        peso_est = 0.75 if tipo_escena == "arquitectura" else 0.55
+        z[es_estructura] = (
+            (1.0 - peso_est) * z[es_estructura] +
+            peso_est * np.maximum(z_prop[es_estructura], z[es_estructura])
+        )
+
+    # Si hay un sujeto destacado en la escena (ej. un auto o una casa principal conservando el fondo),
+    # darle cohesión volumétrica para que no se aplane contra el fondo
+    if mascara_sujeto is not None:
+        frac_s = float(mascara_sujeto.mean())
+        if 0.04 <= frac_s <= 0.75:
+            dist_s = cv2.distanceTransform(mascara_sujeto.astype(np.uint8), cv2.DIST_L2, 5).astype(np.float32)
+            domo_s = np.sqrt(np.clip(dist_s / (float(dist_s.max()) + 1e-6), 0.0, 1.0))
+            domo_s = cv2.GaussianBlur(domo_s, (11, 11), 0)
+            # Anclar el sujeto a la profundidad del suelo en su punto de apoyo inferior
+            ys_s = np.where(mascara_sujeto)[0]
+            y_apoyo = float(np.percentile(ys_s, 95)) / float(H)
+            z_apoyo = float(np.clip((y_apoyo - y_h_efectivo) / (1.0 - y_h_efectivo + 1e-6), 0.35, 0.85))
+            z_sujeto = np.clip(z_apoyo + 0.22 * domo_s, 0.25, 0.98)
+            z = np.where(mascara_sujeto, 0.45 * z + 0.55 * np.maximum(z, z_sujeto), z)
+
     z[es_cielo] = 0.0
-    relieve = 0.05 * L + 0.04 * enfoque
-    z[es_vertical] = np.clip(z_prop[es_vertical] + relieve[es_vertical], 0.12, 1.0)
-    return z.astype(np.float32)
+    return cv2.GaussianBlur(z.astype(np.float32), (5, 5), 0)
 
 
 # --------------------------------------------------------------------------------------
-# Función principal (misma firma de retorno que tu versión original)
+# Función principal
 # --------------------------------------------------------------------------------------
 def agrupar_e_inferir_profundidad(
     img_rgb: np.ndarray,
@@ -260,10 +371,14 @@ def agrupar_e_inferir_profundidad(
     y_h = info_escena["y_horizonte"]
     x_vp = info_escena["x_vp"]
     vp_conf = info_escena.get("vp_confianza", 1.0)
+    tipo_escena = info_escena.get("tipo_escena", "escena")
     img_lab = info_escena["lab_map"]
     enfoque = info_escena["enfoque_map"]
+    grad_map = info_escena["grad_map"]
+    mascara_fg = info_escena.get("mascara_fg", None)
+    mascara_sujeto_escena = info_escena.get("mascara_sujeto_escena", None)
 
-    # 1. K-Means sobre el hipervector (agrupa superpíxeles con apariencia similar)
+    # 1. K-Means sobre el hipervector de superpíxeles
     X = hipervectores[:, :6].copy()
     X[:, 0:2] *= w_espacial
     X[:, 2:5] *= w_color
@@ -278,67 +393,72 @@ def agrupar_e_inferir_profundidad(
     y_norm = (grid_y / float(H)).astype(np.float32)
     x_norm = (grid_x / float(W)).astype(np.float32)
 
-    mascara_fg = info_escena.get("mascara_fg", None)
     usa_suelo = False
     if disp_neural is not None:
         modo = "neural"
-        # 2a. Refinar bordes de la red con la imagen
         d = filtro_guiado_rapido(img_rgb, disp_neural, radio=4, eps=1e-3)
         d = np.clip(d, 0.0, 1.0)
-
-        # 2b. Cielo al infinito
         es_cielo = _mascara_cielo(img_lab, enfoque, y_norm, y_h, d)
         d[es_cielo] = 0.0
 
-        # 2c. Corrección con suelo plano en perspectiva (solo si hay perspectiva lineal fiable)
         if mascara_fg is None and vp_conf >= conf_min_perspectiva:
             g = _prior_suelo(H, W, y_h)
-            zona = (y_norm > max(y_h + 0.10, 0.6)) & (~es_cielo)       # tercio inferior: casi seguro suelo
+            zona = (y_norm > max(y_h + 0.10, 0.6)) & (~es_cielo)
             a, b, _ = _ajuste_robusto(g[zona][::7], d[zona][::7])
-            if a > 0.05:   # el suelo debe acercarse hacia abajo; si no, el ajuste no es creíble
+            if a > 0.05:
                 g_al = np.clip(a * g + b, 0.0, 1.0)
                 es_suelo = (y_norm > y_h) & (np.abs(d - g_al) < 0.08) & (~es_cielo)
-                es_suelo = cv2.morphologyEx(es_suelo.astype(np.uint8), cv2.MORPH_OPEN,
-                                            np.ones((5, 5), np.uint8)) > 0
+                es_suelo = cv2.morphologyEx(
+                    es_suelo.astype(np.uint8), cv2.MORPH_OPEN, np.ones((5, 5), np.uint8)
+                ) > 0
                 d = np.where(es_suelo, d + peso_suelo * (g_al - d), d)
                 d = _anclar_verticales_al_suelo(d, es_suelo, es_cielo, peso_vertical)
                 usa_suelo = True
         if mascara_fg is not None:
-            # Mezclar relieve neural con el perfil volumétrico del objeto para bordes limpios
-            z_domo = _profundidad_volumetrica_objeto(img_lab, enfoque, mascara_fg)
-            d = np.where(mascara_fg, 0.60 * d + 0.40 * z_domo, 0.0)
+            z_domo = _profundidad_volumetrica_objeto(
+                img_rgb, img_lab, enfoque, grad_map, mascara_fg, mapa_clusters
+            )
+            d = np.where(mascara_fg, 0.55 * d + 0.45 * z_domo, 0.0)
         mapa_geom = d
     else:
-        modo = "geometrico"
-        es_cielo = _mascara_cielo(img_lab, enfoque, y_norm, y_h) if mascara_fg is None else ~mascara_fg
-        mapa_geom = _profundidad_geometrica(
-            img_lab, enfoque, y_norm, x_norm, y_h, x_vp, es_cielo,
-            vp_confianza=vp_conf, mascara_fg=mascara_fg
-        )
+        modo = f"universal ({tipo_escena})"
+        if mascara_fg is not None:
+            es_cielo = ~mascara_fg
+            mapa_geom = _profundidad_volumetrica_objeto(
+                img_rgb, img_lab, enfoque, grad_map, mascara_fg, mapa_clusters
+            )
+        else:
+            es_cielo = _mascara_cielo(img_lab, enfoque, y_norm, y_h)
+            usa_suelo = True
+            mapa_geom = _profundidad_escena_universal(
+                img_rgb, img_lab, enfoque, grad_map, y_norm, x_norm,
+                y_h, x_vp, es_cielo, vp_conf, tipo_escena,
+                mascara_sujeto=mascara_sujeto_escena,
+            )
 
-    # 3. Regularización por superpíxeles: planos inclinados (Make3D) + mezcla con el píxel
+    # 3. Regularización por superpíxeles: planos inclinados (Make3D) + mezcla suave
     planos = _ajuste_planos_por_superpixel(mapa_geom, slic_map)
-    mapa_z_bruto = 0.65 * mapa_geom + 0.35 * planos
+    peso_planos = 0.45 if tipo_escena == "arquitectura" else 0.35
+    mapa_z_bruto = (1.0 - peso_planos) * mapa_geom + peso_planos * planos
 
-    # 4. Filtro guiado para devolver los bordes a la silueta real de los objetos
+    # 4. Filtro guiado para alinear bordes de profundidad con la silueta real de cada elemento
     mapa_z_final = filtro_guiado_rapido(img_rgb, mapa_z_bruto, radio=6, eps=5e-4)
     if mascara_fg is not None:
-        # Normalizar únicamente dentro del objeto y anular el fondo
         if mascara_fg.any():
             lo, hi = np.percentile(mapa_z_final[mascara_fg], [2, 99])
             z_fg = np.clip((mapa_z_final - lo) / (hi - lo + 1e-6), 0.0, 1.0)
-            # Garantizar un borde suave que converja a 0.20 en el contorno para que el espejo cierre perfecto
             dist_borde = cv2.distanceTransform(mascara_fg.astype(np.uint8), cv2.DIST_L2, 5)
-            peso_borde = np.clip(dist_borde / max(float(dist_borde.max()) * 0.22, 3.0), 0.0, 1.0)
+            peso_borde = np.clip(dist_borde / max(float(dist_borde.max()) * 0.20, 3.0), 0.0, 1.0)
             mapa_z_final = np.where(mascara_fg, 0.20 + 0.80 * z_fg * np.sqrt(peso_borde), 0.0).astype(np.float32)
         else:
             mapa_z_final = _normalizar(mapa_z_final)
     else:
         mapa_z_final = _normalizar(mapa_z_final)
-        mapa_z_final[es_cielo] = np.minimum(mapa_z_final[es_cielo], 0.02)
+        mapa_z_final[es_cielo] = np.minimum(mapa_z_final[es_cielo], 0.03)
 
     metricas = {
         "modo_profundidad": modo,
+        "tipo_escena": tipo_escena,
         "suelo_en_perspectiva": usa_suelo,
         "fondo_eliminado": mascara_fg is not None,
         "silueta": round(float(silueta), 4),

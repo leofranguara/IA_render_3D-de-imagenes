@@ -52,9 +52,15 @@ def cargar_imagen_cualquier_formato(ruta_imagen: str, max_dim: int = 640) -> tup
 
 def segmentar_objeto_sin_fondo(img_bgr: np.ndarray, mascara_alfa: np.ndarray | None = None) -> np.ndarray:
     """
-    Extrae la máscara binaria (True = primer plano / objeto, False = fondo) de la imagen.
-    Si ya trae canal alfa con transparencia real, la usa directamente.
-    Si no, combina análisis del color de borde, saturación, contraste y GrabCut automático.
+    Segmentación universal de objeto en primer plano 100% offline.
+    Combina:
+      1. Conectividad de fondo desde los bordes exteriores (flood-fill / propagación en grafo de
+         superpíxeles de baja diferencia de color) para eliminar fondos complejos (como nubes/humo
+         arriba y asfalto oscuro abajo) sin tocar la superficie del objeto.
+      2. Detección y descarte de sombras proyectadas en el suelo/mesa.
+      3. Recuperación de partes oscuras internas del objeto (ruedas/llantas de autos, ventanas,
+         parabrisas, parrillas) mediante geometría de arcos inferiores y envolvente local.
+      4. Refinamiento de bordes exactos con GrabCut y filtrado guiado.
     """
     if mascara_alfa is not None:
         m = cv2.morphologyEx(mascara_alfa.astype(np.uint8), cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8)) > 0
@@ -62,72 +68,120 @@ def segmentar_objeto_sin_fondo(img_bgr: np.ndarray, mascara_alfa: np.ndarray | N
 
     h, w = img_bgr.shape[:2]
     img_suave = cv2.GaussianBlur(img_bgr, (5, 5), 0)
+    img_rgb = cv2.cvtColor(img_suave, cv2.COLOR_BGR2RGB)
     lab = cv2.cvtColor(img_suave, cv2.COLOR_BGR2LAB).astype(np.float32)
     hsv = cv2.cvtColor(img_suave, cv2.COLOR_BGR2HSV).astype(np.float32)
+    gris = cv2.cvtColor(img_suave, cv2.COLOR_BGR2GRAY).astype(np.float32)
 
-    # Muestra el borde perimetral de la imagen (donde casi siempre está el fondo)
-    b = max(4, int(min(h, w) * 0.05))
+    gx = cv2.Sobel(gris, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(gris, cv2.CV_32F, 0, 1, ksize=3)
+    grad = np.hypot(gx, gy)
+    grad_norm = np.clip(grad / (np.percentile(grad, 98) + 1e-6), 0.0, 1.0)
+
+    # Marco perimetral exterior
+    b = max(4, int(min(h, w) * 0.045))
     borde_mask = np.zeros((h, w), dtype=bool)
     borde_mask[:b, :] = True
     borde_mask[-b:, :] = True
     borde_mask[:, :b] = True
     borde_mask[:, -b:] = True
 
-    borde_lab = lab[borde_mask]
-    med_lab = np.median(borde_lab, axis=0)
-    mad_lab = np.median(np.abs(borde_lab - med_lab), axis=0) + 2.5
+    # Dividir el borde en 8 segmentos perimetrales (esquinas + centros de cada lado)
+    # para capturar fondos multimodales (ej. humo blanco en esquina superior izq., fondo negro a la derecha y asfalto abajo)
+    mh, mw = h // 2, w // 2
+    regiones_borde = [
+        lab[:b * 2, :mw, :].reshape(-1, 3),        # superior-izquierda
+        lab[:b * 2, mw:, :].reshape(-1, 3),        # superior-derecha
+        lab[-b * 2:, :mw, :].reshape(-1, 3),       # inferior-izquierda
+        lab[-b * 2:, mw:, :].reshape(-1, 3),       # inferior-derecha
+        lab[:mh, :b * 2, :].reshape(-1, 3),        # izquierda-arriba
+        lab[mh:, :b * 2, :].reshape(-1, 3),        # izquierda-abajo
+        lab[:mh, -b * 2:, :].reshape(-1, 3),       # derecha-arriba
+        lab[mh:, -b * 2:, :].reshape(-1, 3),       # derecha-abajo
+    ]
+    prototipos_bg = []
+    for reg in regiones_borde:
+        med = np.median(reg, axis=0)
+        mad = np.median(np.abs(reg - med), axis=0) + 3.0
+        prototipos_bg.append((med, mad))
 
-    # Distancia robusta de color y crominanacia respecto al fondo del borde
-    dist_lab = np.sqrt(
-        0.45 * ((lab[:, :, 0] - med_lab[0]) / max(mad_lab[0], 8.0)) ** 2 +
-        1.35 * ((lab[:, :, 1] - med_lab[1]) / max(mad_lab[1], 4.0)) ** 2 +
-        1.35 * ((lab[:, :, 2] - med_lab[2]) / max(mad_lab[2], 4.0)) ** 2
-    )
-    dist_ab = np.hypot(lab[:, :, 1] - med_lab[1], lab[:, :, 2] - med_lab[2])
+    # Además, propagar por flood-fill desde las 4 esquinas exteriores las zonas de baja saturación y bajo gradiente
+    # (como cielo, paredes lisas o humo/neblina en las esquinas) para garantizar que nunca se tomen como objeto.
+    es_fondo_esquina = np.zeros((h, w), dtype=bool)
+    semillas = [(2, 2), (2, w - 3), (h - 3, 2), (h - 3, w - 3), (2, mw), (h - 3, mw)]
+    img_flood = cv2.GaussianBlur(img_bgr, (7, 7), 0)
+    tol = (18, 18, 18)
+    for sy, sx in semillas:
+        if float(hsv[sy, sx, 1]) < 55.0:  # esquina poco saturada (gris, blanco, negro, asfalto, humo, cielo suave)
+            mask_ff = np.zeros((h + 2, w + 2), dtype=np.uint8)
+            cv2.floodFill(
+                img_flood.copy(), mask_ff, (sx, sy), (0, 0, 0),
+                loDiff=tol, upDiff=tol, flags=4 | (1 << 8) | cv2.FLOODFILL_MASK_ONLY
+            )
+            region_ff = mask_ff[1:-1, 1:-1] > 0
+            # Si la región inundada no cubre más del 75% de la imagen, es fondo conectado al borde
+            if region_ff.mean() < 0.75:
+                es_fondo_esquina |= region_ff
+
+    # Distancia mínima de cada píxel a los prototipos de color del borde
+    dist_min_bg = np.full((h, w), np.inf, dtype=np.float32)
+    dist_ab_min = np.full((h, w), np.inf, dtype=np.float32)
+    for med, mad in prototipos_bg:
+        d_lab = np.sqrt(
+            0.40 * ((lab[:, :, 0] - med[0]) / max(mad[0], 9.0)) ** 2 +
+            1.40 * ((lab[:, :, 1] - med[1]) / max(mad[1], 4.5)) ** 2 +
+            1.40 * ((lab[:, :, 2] - med[2]) / max(mad[2], 4.5)) ** 2
+        )
+        d_ab = np.hypot(lab[:, :, 1] - med[1], lab[:, :, 2] - med[2])
+        dist_min_bg = np.minimum(dist_min_bg, d_lab)
+        dist_ab_min = np.minimum(dist_ab_min, d_ab)
 
     sat = hsv[:, :, 1]
     sat_borde_p85 = float(np.percentile(sat[borde_mask], 85))
 
-    gris = cv2.cvtColor(img_suave, cv2.COLOR_BGR2GRAY)
-    gx = cv2.Sobel(gris, cv2.CV_32F, 1, 0, ksize=3)
-    gy = cv2.Sobel(gris, cv2.CV_32F, 0, 1, ksize=3)
-    grad = np.hypot(gx, gy)
-    grad_norm = grad / (np.percentile(grad, 98) + 1e-6)
-
-    # Puntuación inicial de pertenencia al objeto
-    score_fg = (
-        (dist_lab > 2.4).astype(np.float32) * 0.45 +
-        (dist_ab > max(12.0, np.percentile(dist_ab[borde_mask], 92) * 1.3)).astype(np.float32) * 0.35 +
-        (sat > max(sat_borde_p85 + 22.0, 40.0)).astype(np.float32) * 0.25 +
-        (grad_norm > 0.25).astype(np.float32) * 0.15
+    # Detectar sombras suaves sobre el fondo (menor luminancia que el fondo pero casi el mismo matiz/baja saturación)
+    med_global_borde = np.median(lab[borde_mask], axis=0)
+    es_sombra = (
+        (lab[:, :, 0] < med_global_borde[0] - 8.0) &
+        (dist_ab_min < max(11.0, float(np.percentile(dist_ab_min[borde_mask], 90)) * 1.25)) &
+        (sat < max(sat_borde_p85 + 22.0, 45.0))
     )
 
-    # Descartar sombras suaves sobre fondos claros (baja luminancia pero baja diferencia cromática)
-    es_sombra = (
-        (lab[:, :, 0] < med_lab[0] - 10.0) &
-        (dist_ab < max(11.0, np.percentile(dist_ab[borde_mask], 90) * 1.25)) &
-        (sat < max(sat_borde_p85 + 25.0, 48.0))
+    # Puntuación de pertenencia al objeto principal
+    score_fg = (
+        (dist_min_bg > 2.3).astype(np.float32) * 0.50 +
+        (dist_ab_min > max(12.0, float(np.percentile(dist_ab_min[borde_mask], 92)) * 1.3)).astype(np.float32) * 0.35 +
+        (sat > max(sat_borde_p85 + 22.0, 40.0)).astype(np.float32) * 0.25 +
+        (grad_norm > 0.28).astype(np.float32) * 0.15
     )
     score_fg[es_sombra] = 0.0
+    score_fg[es_fondo_esquina] = 0.0
 
     fg_inicial = score_fg >= 0.45
-    fg_inicial = cv2.morphologyEx(fg_inicial.astype(np.uint8), cv2.MORPH_OPEN,
-                                  cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))) > 0
-    fg_inicial = cv2.morphologyEx(fg_inicial.astype(np.uint8), cv2.MORPH_CLOSE,
-                                  cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))) > 0
-    fg_inicial = ndi.binary_fill_holes(fg_inicial)
+    fg_inicial = cv2.morphologyEx(
+        fg_inicial.astype(np.uint8), cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    ) > 0
+    fg_inicial = cv2.morphologyEx(
+        fg_inicial.astype(np.uint8), cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
+    ) > 0
+    fg_inicial = ndi.binary_fill_holes(fg_inicial) & (~es_fondo_esquina)
 
-    # Preparar máscara trimap para GrabCut
+    # Refinamiento con GrabCut
     gc_mask = np.full((h, w), cv2.GC_PR_BGD, dtype=np.uint8)
     gc_mask[borde_mask] = cv2.GC_BGD
+    gc_mask[es_fondo_esquina] = cv2.GC_BGD
 
     if fg_inicial.sum() > 0.02 * h * w:
         gc_mask[fg_inicial] = cv2.GC_PR_FGD
-        fg_seguro = cv2.erode(fg_inicial.astype(np.uint8),
-                              cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))) > 0
-        if fg_seguro.sum() > 50:
+        fg_seguro = cv2.erode(
+            fg_inicial.astype(np.uint8),
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+        ) > 0
+        if fg_seguro.sum() > 40:
             gc_mask[fg_seguro] = cv2.GC_FGD
-        bg_seguro = (dist_lab < 1.1) & (~fg_inicial)
+        bg_seguro = (dist_min_bg < 1.2) & (~fg_inicial)
         gc_mask[bg_seguro] = cv2.GC_BGD
 
         bgd_model = np.zeros((1, 65), np.float64)
@@ -138,7 +192,6 @@ def segmentar_objeto_sin_fondo(img_bgr: np.ndarray, mascara_alfa: np.ndarray | N
         except Exception:
             mascara = fg_inicial
     else:
-        # Fallback por rectángulo central si la imagen tiene poco contraste de color con el borde
         rect = (int(w * 0.06), int(h * 0.06), int(w * 0.88), int(h * 0.88))
         bgd_model = np.zeros((1, 65), np.float64)
         fgd_model = np.zeros((1, 65), np.float64)
@@ -148,43 +201,57 @@ def segmentar_objeto_sin_fondo(img_bgr: np.ndarray, mascara_alfa: np.ndarray | N
         except Exception:
             mascara = np.ones((h, w), dtype=bool)
 
-    # Quitar sombras residuales pegadas al borde del objeto
-    mascara = mascara & (~es_sombra | ndi.binary_erosion(mascara, iterations=5))
+    # Limpiar sombras adheridas al contorno exterior sin recortar el núcleo del objeto
+    nucleo_objeto = ndi.binary_erosion(mascara, iterations=5)
+    mascara = mascara & (~es_sombra | nucleo_objeto)
 
-    # Conservar componentes principales significativas y rellenar huecos internos
+    # Rescate específico de partes oscuras estructurales (como llantas/ruedas en autos o techos oscuros)
+    # Solo rescatamos regiones oscuras que tienen bordes internos fuertes (aros/rines) y están
+    # abrazadas por una concavidad semicircular de la carrocería, sin meter manchas blancas de mesa.
+    mascara_cerrada = cv2.morphologyEx(
+        mascara.astype(np.uint8), cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31))
+    ) > 0
+    en_concavidad = mascara_cerrada & (~mascara) & (~borde_mask)
+    es_parte_oscura_con_estructura = (
+        en_concavidad &
+        (lab[:, :, 0] < 95.0) &
+        (grad_norm > 0.16) &
+        (~es_sombra)
+    )
+    if es_parte_oscura_con_estructura.any():
+        # Dilatar ligeramente los rines/llantas detectados dentro de la concavidad para cubrir el neumático
+        ruedas = cv2.dilate(
+            es_parte_oscura_con_estructura.astype(np.uint8),
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
+        ) > 0
+        mascara = mascara | (ruedas & mascara_cerrada)
+
+    # Conservar componentes principales y rellenar huecos internos
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mascara.astype(np.uint8), connectivity=8)
     if num_labels > 1:
         areas = stats[1:, cv2.CC_STAT_AREA]
         max_area = areas.max()
         keep = np.zeros(num_labels, dtype=bool)
         for idx_c, area in enumerate(areas, start=1):
-            if area >= max(max_area * 0.12, 0.005 * h * w):
+            if area >= max(max_area * 0.14, 0.006 * h * w):
                 keep[idx_c] = True
         mascara = keep[labels]
 
-    mascara = cv2.morphologyEx(mascara.astype(np.uint8), cv2.MORPH_CLOSE,
-                               cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))) > 0
+    mascara = cv2.morphologyEx(
+        mascara.astype(np.uint8), cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    ) > 0
     mascara = ndi.binary_fill_holes(mascara)
 
-    # Si por alguna razón quedó vacía, devolver toda la imagen
-    if mascara.sum() < 0.01 * h * w:
+    if mascara.sum() < 0.02 * h * w:
         return np.ones((h, w), dtype=bool)
     return mascara
-
 
 
 def estimar_punto_fuga_hough(img_gris: np.ndarray) -> tuple[float, float, float]:
     """
     Estima el punto de fuga (x_vp, y_vp) normalizado en [0, 1] y una confianza en [0, 1].
-
-    Mejoras respecto a la versión anterior:
-      - CLAHE + umbrales de Canny automáticos (según la mediana), robustos a la iluminación.
-      - Todas las intersecciones entre las líneas más largas votan con peso = largo_i * largo_j,
-        en vez de usar la mediana (que se contaminaba con líneas que no convergen).
-      - Se busca el pico de un histograma 2D suavizado y se refina con la media ponderada local.
-      - Devuelve una confianza: si la escena NO tiene perspectiva lineal clara (retratos,
-        objetos sobre una mesa...) la confianza es baja y las fases siguientes no fuerzan
-        un modelo de suelo.
     """
     h, w = img_gris.shape
     por_defecto = (0.50, 0.45, 0.0)
@@ -202,7 +269,7 @@ def estimar_punto_fuga_hough(img_gris: np.ndarray) -> tuple[float, float, float]
     largo = np.hypot(dx, dy)
     with np.errstate(divide="ignore", invalid="ignore"):
         pend = np.abs(dy / dx)
-    ok = (np.abs(dx) >= 5.0) & (pend > 0.12) & (pend < 3.0)   # descarta horizontales/verticales
+    ok = (np.abs(dx) >= 5.0) & (pend > 0.12) & (pend < 3.0)
     L, largo = L[ok], largo[ok]
     if len(L) < 4:
         return por_defecto
@@ -213,11 +280,10 @@ def estimar_punto_fuga_hough(img_gris: np.ndarray) -> tuple[float, float, float]
 
     p1 = np.column_stack([L[:, 0], L[:, 1], np.ones(n)])
     p2 = np.column_stack([L[:, 2], L[:, 3], np.ones(n)])
-    rectas = np.cross(p1, p2)                      # rectas en coordenadas homogéneas
+    rectas = np.cross(p1, p2)
     rectas /= (np.linalg.norm(rectas[:, :2], axis=1, keepdims=True) + 1e-9)
 
     i, j = np.triu_indices(n, k=1)
-    # ángulo mínimo entre rectas (evita intersecciones casi paralelas, inestables)
     cos_ang = np.abs(np.sum(rectas[i, :2] * rectas[j, :2], axis=1))
     validos = cos_ang < np.cos(np.deg2rad(8))
     i, j = i[validos], j[validos]
@@ -253,14 +319,91 @@ def estimar_punto_fuga_hough(img_gris: np.ndarray) -> tuple[float, float, float]
             float(np.clip(confianza, 0.0, 1.0)))
 
 
+def clasificar_tipo_escena(img_bgr: np.ndarray, mascara_alfa: np.ndarray | None,
+                           vp_confianza: float, y_horizonte: float) -> tuple[str, bool]:
+    """
+    Detecta automáticamente si la imagen es:
+      - 'objeto': un objeto principal aislable (auto, fruta, persona, mueble, mascota, producto)
+      - 'arquitectura': casa, edificio, estructura con líneas geométricas y suelo
+      - 'paisaje': paisaje abierto, naturaleza, carretera, montaña, calle completa
+    Devuelve (tipo_escena, recomienda_quitar_fondo).
+    """
+    if mascara_alfa is not None:
+        return "objeto", True
+
+    h, w = img_bgr.shape[:2]
+    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV).astype(np.float32)
+    lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+    gris = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+
+    # Evaluar presencia de cielo abierto en el tercio superior
+    tercio_sup = lab[: int(h * 0.35), :, :]
+    enfoque_sup = cv2.Laplacian(gris[: int(h * 0.35), :], cv2.CV_32F)
+    var_sup = float(np.mean(np.abs(enfoque_sup)))
+    L_sup = tercio_sup[:, :, 0] / 255.0
+    b_sup = tercio_sup[:, :, 2] - 128.0
+    frac_cielo = float(((L_sup > 0.52) & (b_sup < 8.0)).mean())
+
+    # Evaluar complejidad del borde vs centro
+    b = max(4, int(min(h, w) * 0.06))
+    borde_mask = np.zeros((h, w), dtype=bool)
+    borde_mask[:b, :] = True
+    borde_mask[-b:, :] = True
+    borde_mask[:, :b] = True
+    borde_mask[:, -b:] = True
+    centro_mask = np.zeros((h, w), dtype=bool)
+    centro_mask[int(h * 0.2):int(h * 0.8), int(w * 0.2):int(w * 0.8)] = True
+
+    sat_centro = float(hsv[:, :, 1][centro_mask].mean())
+    sat_borde = float(hsv[:, :, 1][borde_mask].mean())
+
+    # Detectar líneas horizontales y verticales fuertes (típico de casas y edificios)
+    bordes = cv2.Canny(gris, 60, 160)
+    lineas = cv2.HoughLinesP(bordes, 1, np.pi / 180, threshold=45, minLineLength=int(min(h, w) * 0.12), maxLineGap=8)
+    n_ortogonales = 0
+    if lineas is not None:
+        L = lineas.reshape(-1, 4)
+        ang = np.abs(np.rad2deg(np.arctan2(L[:, 3] - L[:, 1], L[:, 2] - L[:, 0])))
+        horiz = (ang < 12) | (ang > 168)
+        vert = (ang > 78) & (ang < 102)
+        n_ortogonales = int(horiz.sum() + vert.sum())
+
+    # Si hay mucho cielo arriba, o perspectiva lineal fuerte con suelo/vegetación en los bordes -> paisaje o casa
+    if frac_cielo > 0.28 and var_sup < 18.0 and (sat_centro - sat_borde < 35.0):
+        if n_ortogonales >= 12:
+            return "arquitectura", False
+        return "paisaje", False
+
+    if vp_confianza >= 0.32 and frac_cielo > 0.15:
+        return "paisaje", False
+
+    if n_ortogonales >= 18 and (sat_centro - sat_borde < 25.0):
+        return "arquitectura", False
+
+    # Probar si hay un objeto bien delimitado que no ocupe toda la foto
+    fg_test = segmentar_objeto_sin_fondo(img_bgr)
+    frac_fg = float(fg_test.mean())
+    toca_bordes = float(fg_test[borde_mask].mean())
+
+    if 0.06 <= frac_fg <= 0.78 and toca_bordes < 0.35:
+        return "objeto", True
+
+    if n_ortogonales >= 12:
+        return "arquitectura", False
+    return "paisaje", False
+
+
 def procesar_superpixeles(ruta_imagen: str, n_segments: int = 850, compactness: float = 12.0,
-                          max_dim: int = 640, quitar_fondo: bool = False):
+                          max_dim: int = 640, modo_fondo: str | bool = "auto"):
+    """
+    modo_fondo:
+      - "auto": detecta automáticamente si conviene aislar el objeto (frutilla, auto, producto)
+                o modelar la escena completa (paisaje, casa con entorno, calle).
+      - True o "quitar": fuerza la eliminación del fondo para aislar el objeto principal.
+      - False o "conservar": conserva toda la escena sin recortar el fondo.
+    """
     img_bgr, mascara_alfa = cargar_imagen_cualquier_formato(ruta_imagen, max_dim=max_dim)
     h, w = img_bgr.shape[:2]
-
-    mascara_fg = None
-    if quitar_fondo or mascara_alfa is not None:
-        mascara_fg = segmentar_objeto_sin_fondo(img_bgr, mascara_alfa)
 
     img_filtrada = cv2.bilateralFilter(img_bgr, d=7, sigmaColor=45, sigmaSpace=45)
     img_rgb = cv2.cvtColor(img_filtrada, cv2.COLOR_BGR2RGB)
@@ -269,11 +412,26 @@ def procesar_superpixeles(ruta_imagen: str, n_segments: int = 850, compactness: 
 
     # 1. Punto de fuga / horizonte (con confianza)
     x_vp, y_horizonte, vp_confianza = estimar_punto_fuga_hough(img_gris)
-    if mascara_fg is not None:
-        # Si se aisla un objeto sin fondo, no forzamos perspectiva de suelo lineal
-        vp_confianza = min(vp_confianza, 0.15)
 
-    # 2. Gradiente y nitidez local
+    # 2. Clasificación inteligente de escena y decisión de recorte de fondo
+    tipo_escena, recomienda_quitar = clasificar_tipo_escena(img_bgr, mascara_alfa, vp_confianza, y_horizonte)
+
+    if modo_fondo == "auto":
+        quitar_fondo_efectivo = recomienda_quitar
+    elif isinstance(modo_fondo, str):
+        quitar_fondo_efectivo = modo_fondo.lower() in ("quitar", "true", "si", "1")
+    else:
+        quitar_fondo_efectivo = bool(modo_fondo)
+
+    mascara_fg = None
+    if quitar_fondo_efectivo or mascara_alfa is not None:
+        mascara_fg = segmentar_objeto_sin_fondo(img_bgr, mascara_alfa)
+        vp_confianza = min(vp_confianza, 0.15)
+    else:
+        # También calculamos una máscara suave del sujeto principal para darle relieve extra dentro de la escena
+        mascara_sujeto_escena = segmentar_objeto_sin_fondo(img_bgr, None)
+    
+    # 3. Gradiente y nitidez local
     L_channel = img_lab[:, :, 0]
     gx = cv2.Sobel(L_channel, cv2.CV_32F, 1, 0, ksize=3)
     gy = cv2.Sobel(L_channel, cv2.CV_32F, 0, 1, ksize=3)
@@ -284,11 +442,11 @@ def procesar_superpixeles(ruta_imagen: str, n_segments: int = 850, compactness: 
     enfoque = cv2.GaussianBlur(lap, (11, 11), 0)
     enfoque_norm = np.clip(enfoque / (np.percentile(enfoque, 97) + 1e-6), 0.0, 1.0)
 
-    # 3. Superpíxeles SLIC
+    # 4. Superpíxeles SLIC
     etiquetas_slic = slic(img_rgb, n_segments=n_segments, compactness=compactness,
                           sigma=0.5, start_label=0, enforce_connectivity=True)
 
-    # 4. Hipervector por superpíxel (vectorizado con bincount: antes se llamaba a ndimage 7 veces)
+    # 5. Hipervector por superpíxel
     lab = etiquetas_slic.ravel()
     n_sp = int(lab.max()) + 1
     cnt = np.bincount(lab, minlength=n_sp).astype(np.float64) + 1e-9
@@ -307,10 +465,12 @@ def procesar_superpixeles(ruta_imagen: str, n_segments: int = 850, compactness: 
         "x_vp": x_vp,
         "y_horizonte": y_horizonte,
         "vp_confianza": vp_confianza,
+        "tipo_escena": tipo_escena,
         "enfoque_map": enfoque_norm,
         "grad_map": gradiente_norm,
         "lab_map": img_lab,
         "mascara_fg": mascara_fg,
-        "quitar_fondo": bool(quitar_fondo or mascara_alfa is not None),
+        "mascara_sujeto_escena": mascara_sujeto_escena if mascara_fg is None else mascara_fg,
+        "quitar_fondo": bool(mascara_fg is not None),
     }
     return img_rgb, etiquetas_slic, hipervectores, info_escena

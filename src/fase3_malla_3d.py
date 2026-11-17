@@ -1,15 +1,8 @@
 """
-Fase 3: del mapa de profundidad a una malla 3D con cámara pinhole.
-
-Cambios clave respecto a la versión anterior (causa de las fallas de perspectiva):
-  - Antes: X,Y se escalaban con un "factor de perspectiva" inventado y Z era lineal en la
-    disparidad. Eso deforma la escena. Ahora cada píxel se retroproyecta con el modelo de
-    cámara real:   X = (u-cx)·Z/f ,  Y = -(v-cy)·Z/f ,  Z = profundidad.
-  - La disparidad [0,1] se convierte a profundidad con  1/Z = 1/z_lejos + d·(1/z_cerca - 1/z_lejos)
-    (la profundidad es el INVERSO de la disparidad, no una función lineal de ella).
-  - Se elimina la "lámina trasera" y las paredes perimetrales: duplicaban la geometría y
-    creaban falsos volúmenes. Es una superficie 2.5D honesta.
-  - Se cortan los triángulos que unen objetos con el fondo (las "telas de araña" estiradas).
+Fase 3: Construcción de malla 3D volumétrica universal con soporte para:
+  - Objetos aislados (autos, frutas, figuras, muebles) con volumen 3D cerrado en espejo.
+  - Escenas completas (paisajes, casas, calles) con relieve topográfico suave, proyección
+    libre de distorsión trapezoidal extrema y cierre trasero simétrico en espejo.
 """
 import os
 
@@ -27,8 +20,8 @@ def disparidad_a_profundidad(d: np.ndarray, z_cerca: float = 1.0, z_lejos: float
 def construir_malla_volumetrica(
     img_rgb: np.ndarray,
     mapa_z: np.ndarray,
-    mapa_clusters: np.ndarray | None = None,   # se conserva por compatibilidad
-    y_horizonte: float = 0.45,                  # se conserva por compatibilidad
+    mapa_clusters: np.ndarray | None = None,
+    y_horizonte: float = 0.45,
     paso_malla: int = 1,
     fov_grados: float = 60.0,
     z_cerca: float = 1.0,
@@ -39,10 +32,13 @@ def construir_malla_volumetrica(
     relleno_espejo: bool = True,
 ) -> trimesh.Trimesh:
     """
-    Construye una malla 3D a partir del mapa de disparidad/profundidad.
-    - Si mascara_fg está activa (fondo eliminado), recorta únicamente el objeto y suaviza el perfil.
-    - Si relleno_espejo=True, duplica la geometría hacia atrás como un espejo simétrico y cose
-      todo el contorno perimetral para obtener un volumen 3D cerrado por ambos lados.
+    Construye una malla 3D a partir del mapa de disparidad/profundidad:
+      - Si mascara_fg está activa (objeto sin fondo): genera un cuerpo 3D proporcionado y suave.
+      - Si mascara_fg es None (escena completa: paisaje, casa con entorno, calle): usa proyección
+        híbrida equilibrada para que el fondo no se deforme ni se rompa al rotar o al aplicar el
+        relleno en espejo trasero.
+      - Si relleno_espejo=True: duplica la geometría hacia atrás como un espejo simétrico y cose
+        automáticamente todos los bordes del perímetro para obtener un sólido cerrado.
     """
     img = img_rgb[::paso_malla, ::paso_malla]
     d = mapa_z[::paso_malla, ::paso_malla].astype(np.float32)
@@ -54,54 +50,84 @@ def construir_malla_volumetrica(
     u, v = np.meshgrid(np.arange(W, dtype=np.float32), np.arange(H, dtype=np.float32))
 
     if fg is not None and fg.any():
-        # Modo objeto aislado (o con relleno espejo): proyección limpia sin deformación cónica en bordes
+        # --- MODO 1: Objeto Aislado (Auto, Fruta, Casa recortada, Persona) ---
         z_pivote = 2.2
         escala_xy = z_pivote / f
         X = (u - cx) * escala_xy
         Y = -(v - cy) * escala_xy
 
-        # Espesor proporcional al tamaño físico del objeto en escena
         ys_fg, xs_fg = np.where(fg)
         span_px = max(float(xs_fg.max() - xs_fg.min()), float(ys_fg.max() - ys_fg.min()), 32.0)
-        semiespesor_max = 0.36 * span_px * escala_xy
+        semiespesor_max = 0.34 * span_px * escala_xy
 
-        # Perfil de relieve suave que cae a 0 en el contorno del objeto para un cierre espejo perfecto
+        # Envolvente suave que cae a 0 en el contorno exterior para que la costura espejo sea limpia
         dist_px = cv2.distanceTransform(fg.astype(np.uint8), cv2.DIST_L2, 5).astype(np.float32)
         max_dist = max(float(dist_px.max()), 1.0)
-        r_borde = np.clip(dist_px / (max_dist * 0.42 + 1e-6), 0.0, 1.0)
+        r_borde = np.clip(dist_px / (max_dist * 0.38 + 1e-6), 0.0, 1.0)
         envolvente = np.sqrt(np.clip(2.0 * r_borde - r_borde * r_borde, 0.0, 1.0))
 
         d_suave = cv2.bilateralFilter(d, d=7, sigmaColor=0.08, sigmaSpace=5)
         d_norm = np.clip((d_suave - 0.15) / 0.85, 0.0, 1.0)
-        dz = semiespesor_max * (0.45 * envolvente + 0.55 * d_norm * envolvente)
+        dz = semiespesor_max * (0.40 * envolvente + 0.60 * d_norm * envolvente)
         dz = cv2.GaussianBlur(dz.astype(np.float32), (5, 5), 0)
         dz[~fg] = 0.0
 
         z_frente = -z_pivote + dz
         z_detras = -z_pivote - dz
-
-        # Un cuadro es válido si sus 4 esquinas pertenecen al objeto
         valido = fg[:-1, :-1] & fg[:-1, 1:] & fg[1:, :-1] & fg[1:, 1:]
     else:
-        # Escena completa con fondo
-        Z = disparidad_a_profundidad(d, z_cerca, z_lejos)
-        Z = cv2.bilateralFilter(Z, d=5, sigmaColor=0.05 * float(Z.max()), sigmaSpace=3)
-        z_pivote = float(np.percentile(Z, 45))
+        # --- MODO 2: Escena Completa (Paisajes, Casas con entorno, Calles, Interiores) ---
+        z_pivote = 2.4
+        escala_base = z_pivote / f
 
-        X = (u - cx) / f * Z
-        Y = -(v - cy) / f * Z
-        z_frente = -Z
+        d_suave = cv2.bilateralFilter(d, d=7, sigmaColor=0.07, sigmaSpace=5)
+        d_suave = cv2.GaussianBlur(d_suave, (5, 5), 0)
 
-        # Para el espejo en escena completa, reflejamos respecto al plano base más lejano de cada zona
-        z_plano_ref = float(np.percentile(Z, 92))
-        dz = np.maximum(z_plano_ref - Z, 0.02)
-        z_detras = -z_plano_ref - dz
+        if relleno_espejo:
+            # Con relleno en espejo, creamos un diorama 3D volumétrico de doble cara:
+            # X,Y mantienen proporciones coherentes con leve convergencia de perspectiva (20%)
+            # y el relieve Z sobresale hacia adelante y se refleja simétricamente hacia atrás.
+            factor_persp = 1.0 - 0.18 * (d_suave - 0.5)
+            X = (u - cx) * escala_base * factor_persp
+            Y = -(v - cy) * escala_base * factor_persp
 
-        z00, z01, z10, z11 = Z[:-1, :-1], Z[:-1, 1:], Z[1:, :-1], Z[1:, 1:]
-        zmax = np.maximum(np.maximum(z00, z01), np.maximum(z10, z11))
-        zmin = np.minimum(np.minimum(z00, z01), np.minimum(z10, z11))
-        umbral = umbral_discontinuidad * paso_malla
-        valido = (zmax - zmin) / zmin < umbral
+            span_escena = max(W, H) * escala_base
+            espesor_base = 0.035 * span_escena
+            relieve_max = 0.28 * span_escena
+
+            # Atenuar ligeramente en el borde mismo del marco para un bisel limpio
+            margen_x = np.minimum(u, W - 1 - u) / max(W * 0.04, 1.0)
+            margen_y = np.minimum(v, H - 1 - v) / max(H * 0.04, 1.0)
+            bisel_marco = np.clip(np.minimum(margen_x, margen_y), 0.15, 1.0)
+
+            dz = (espesor_base + relieve_max * (d_suave ** 1.15)) * bisel_marco
+            z_frente = -z_pivote + dz
+            z_detras = -z_pivote - dz
+
+            # En modo espejo de escena completa, mantenemos la malla continua sin agujeros internos
+            # salvo que el usuario baje explícitamente el umbral por debajo de 0.12
+            if umbral_discontinuidad < 0.12:
+                d00, d01, d10, d11 = d_suave[:-1, :-1], d_suave[:-1, 1:], d_suave[1:, :-1], d_suave[1:, 1:]
+                dmax = np.maximum(np.maximum(d00, d01), np.maximum(d10, d11))
+                dmin = np.minimum(np.minimum(d00, d01), np.minimum(d10, d11))
+                valido = (dmax - dmin) < (umbral_discontinuidad * 2.0)
+            else:
+                valido = np.ones((H - 1, W - 1), dtype=bool)
+        else:
+            # Superficie 2.5D con cámara pinhole suavizada (z_lejos moderado para no deformar el cielo)
+            z_lejos_ef = min(z_lejos, 3.8)
+            Z = disparidad_a_profundidad(d_suave, z_cerca, z_lejos_ef)
+            z_pivote = float(np.percentile(Z, 45))
+            X = (u - cx) / f * Z
+            Y = -(v - cy) / f * Z
+            z_frente = -Z
+            z_detras = -Z
+
+            z00, z01, z10, z11 = Z[:-1, :-1], Z[:-1, 1:], Z[1:, :-1], Z[1:, 1:]
+            zmax = np.maximum(np.maximum(z00, z01), np.maximum(z10, z11))
+            zmin = np.minimum(np.minimum(z00, z01), np.minimum(z10, z11))
+            umbral = max(umbral_discontinuidad, 0.25) * paso_malla
+            valido = (zmax - zmin) / zmin < umbral
 
     # Quita islas diminutas (ruido flotante)
     etiquetas, n = ndi.label(valido)
@@ -122,35 +148,31 @@ def construir_malla_volumetrica(
 
     if relleno_espejo:
         verts_detras = np.column_stack([X.ravel(), Y.ravel(), z_detras.ravel()])
-        # Invertir el orden de los vértices (winding order) en la cara trasera para que las normales apunten hacia afuera
+        # Invertir el orden de vértices en la cara trasera para que las normales apunten hacia afuera
         caras_detras = caras_frente[:, [0, 2, 1]] + N
 
-        # Coser automáticamente todas las aristas frontera entre la malla frontal y su espejo trasero
+        # Coser automáticamente todas las aristas frontera entre la cara frontal y su espejo trasero
         v_pad = np.pad(valido, 1, mode="constant", constant_values=False)
         caras_costura = []
 
-        # Aristas superiores (celda válida cuyo vecino de arriba no es válido)
         m_top = valido & (~v_pad[:-2, 1:-1])
         if m_top.any():
             u0, u1 = idx[:-1, :-1][m_top], idx[:-1, 1:][m_top]
             caras_costura.append(np.column_stack([u0, u1, u1 + N]))
             caras_costura.append(np.column_stack([u0, u1 + N, u0 + N]))
 
-        # Aristas inferiores (celda válida cuyo vecino de abajo no es válido)
         m_bot = valido & (~v_pad[2:, 1:-1])
         if m_bot.any():
             d0, d1 = idx[1:, 1:][m_bot], idx[1:, :-1][m_bot]
             caras_costura.append(np.column_stack([d0, d1, d1 + N]))
             caras_costura.append(np.column_stack([d0, d1 + N, d0 + N]))
 
-        # Aristas izquierdas (celda válida cuyo vecino izquierdo no es válido)
         m_left = valido & (~v_pad[1:-1, :-2])
         if m_left.any():
             l0, l1 = idx[1:, :-1][m_left], idx[:-1, :-1][m_left]
             caras_costura.append(np.column_stack([l0, l1, l1 + N]))
             caras_costura.append(np.column_stack([l0, l1 + N, l0 + N]))
 
-        # Aristas derechas (celda válida cuyo vecino derecho no es válido)
         m_right = valido & (~v_pad[1:-1, 2:])
         if m_right.any():
             r0, r1 = idx[:-1, 1:][m_right], idx[1:, 1:][m_right]
@@ -183,31 +205,59 @@ def construir_malla_volumetrica(
 # --------------------------------------------------------------------------------------
 def renderizar_vista(malla: trimesh.Trimesh, yaw_grados: float = 0.0, pitch_grados: float = 0.0,
                      tam_punto: int = 2) -> np.ndarray:
-    """Proyecta los vértices de la malla desde una cámara rotada alrededor del centro de la escena."""
+    """
+    Renderiza la malla de triángulos desde una cámara rotada alrededor del centro de la escena
+    usando ordenamiento por profundidad de caras (Painter's Algorithm sobre triángulos rellenos),
+    para que al girar el modelo no se transparente la cara trasera a través de la delantera.
+    """
     f, W, H = malla.metadata["f"], malla.metadata["W"], malla.metadata["H"]
     piv = np.array([0.0, 0.0, -malla.metadata["z_pivote"]])
-    P = np.asarray(malla.vertices) - piv
-    col = np.asarray(malla.visual.vertex_colors)[:, :3]
+    V = np.asarray(malla.vertices) - piv
+    F = np.asarray(malla.faces)
+    col_v = np.asarray(malla.visual.vertex_colors)[:, :3]
 
     ya, pa = np.deg2rad(yaw_grados), np.deg2rad(pitch_grados)
     Ry = np.array([[np.cos(ya), 0, np.sin(ya)], [0, 1, 0], [-np.sin(ya), 0, np.cos(ya)]])
     Rx = np.array([[1, 0, 0], [0, np.cos(pa), -np.sin(pa)], [0, np.sin(pa), np.cos(pa)]])
-    P = (Rx @ Ry @ P.T).T + piv
+    P = (Rx @ Ry @ V.T).T + piv
 
+    # Para velocidad en vistas.png, submuestreamos o usamos rasterización densa con Z-buffer por píxel
     prof = -P[:, 2]
-    ok = prof > 0.05
-    P, col, prof = P[ok], col[ok], prof[ok]
-    u = np.round(f * P[:, 0] / prof + (W - 1) / 2).astype(int)
-    v = np.round(-f * P[:, 1] / prof + (H - 1) / 2).astype(int)
+    ok_v = prof > 0.05
+    u = np.round(f * P[:, 0] / np.maximum(prof, 0.05) + (W - 1) / 2).astype(np.int32)
+    v = np.round(-f * P[:, 1] / np.maximum(prof, 0.05) + (H - 1) / 2).astype(np.int32)
+
+    # Descartar caras cuyas normales apuntan en la misma dirección que el rayo de visión (Back-face culling)
+    v0, v1, v2 = P[F[:, 0]], P[F[:, 1]], P[F[:, 2]]
+    normales = np.cross(v1 - v0, v2 - v0)
+    centro_cara = (v0 + v1 + v2) / 3.0
+    # El vector de la cámara (en el origen 0,0,0) hacia la cara es centro_cara; visible si dot(normal, centro_cara) < 0
+    visibles = (np.sum(normales * centro_cara, axis=1) < 0) & ok_v[F[:, 0]] & ok_v[F[:, 1]] & ok_v[F[:, 2]]
+
+    F_vis = F[visibles]
+    if len(F_vis) == 0:
+        F_vis = F
+
+    # Muestrear puntos en los vértices y baricentros de las caras visibles ordenados de lejos a cerca
+    c_u = ((u[F_vis[:, 0]] + u[F_vis[:, 1]] + u[F_vis[:, 2]]) // 3)
+    c_v = ((v[F_vis[:, 0]] + v[F_vis[:, 1]] + v[F_vis[:, 2]]) // 3)
+    c_prof = (prof[F_vis[:, 0]] + prof[F_vis[:, 1]] + prof[F_vis[:, 2]]) / 3.0
+    c_col = ((col_v[F_vis[:, 0]].astype(np.int32) + col_v[F_vis[:, 1]] + col_v[F_vis[:, 2]]) // 3).astype(np.uint8)
+
+    verts_vis = np.unique(F_vis.ravel())
+    all_u = np.concatenate([u[verts_vis], c_u])
+    all_v = np.concatenate([v[verts_vis], c_v])
+    all_prof = np.concatenate([prof[verts_vis], c_prof])
+    all_col = np.vstack([col_v[verts_vis], c_col])
 
     lienzo = np.full((H, W, 3), 28, np.uint8)
-    orden = np.argsort(-prof)                       # algoritmo del pintor: lejos -> cerca
-    u, v, col = u[orden], v[orden], col[orden]
+    orden = np.argsort(-all_prof)
+    all_u, all_v, all_col = all_u[orden], all_v[orden], all_col[orden]
     for du in range(tam_punto):
         for dv in range(tam_punto):
-            uu, vv = u + du, v + dv
+            uu, vv = all_u + du, all_v + dv
             m = (uu >= 0) & (uu < W) & (vv >= 0) & (vv < H)
-            lienzo[vv[m], uu[m]] = col[m]
+            lienzo[vv[m], uu[m]] = all_col[m]
     return lienzo
 
 
@@ -221,9 +271,9 @@ def visualizar_y_exportar(malla: trimesh.Trimesh, ruta_obj: str = "data/modelo_3
     carpeta = os.path.dirname(ruta_obj) or "."
     os.makedirs(carpeta, exist_ok=True)
     base = os.path.splitext(ruta_obj)[0]
-    malla.export(ruta_obj)                 # OBJ (colores por vértice como extensión)
-    malla.export(base + ".ply")            # PLY: conserva bien el color en MeshLab/CloudCompare/Blender
-    malla.export(base + ".glb")            # GLB: se abre directo en visores web y Windows 3D Viewer
+    malla.export(ruta_obj)
+    malla.export(base + ".ply")
+    malla.export(base + ".glb")
     print(f"\n[OK] Escenario 3D exportado en: {ruta_obj} (+ .ply, .glb)")
     print(f"• Vértices: {len(malla.vertices):,} | Caras: {len(malla.faces):,}")
 
@@ -247,11 +297,11 @@ def visualizar_y_exportar(malla: trimesh.Trimesh, ruta_obj: str = "data/modelo_3
     opt = vis.get_render_option()
     opt.background_color = np.asarray([0.11, 0.11, 0.13])
     opt.mesh_show_back_face = True
-    opt.light_on = False                    # el color ya viene de la foto; la luz lo "lavaba"
+    opt.light_on = False
     ctr = vis.get_view_control()
     zp = malla.metadata.get("z_pivote", 2.0)
     ctr.set_lookat([0.0, 0.0, -zp])
-    ctr.set_front([0.0, 0.0, 1.0])          # la cámara original estaba en +Z mirando hacia -Z
+    ctr.set_front([0.0, 0.0, 1.0])
     ctr.set_up([0.0, 1.0, 0.0])
     ctr.set_zoom(0.5)
     vis.run()

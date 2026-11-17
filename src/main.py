@@ -2,11 +2,10 @@
 Uso (desde la carpeta raíz del proyecto):
     python src/main.py                                        # Abre el Menú Principal interactivo
     python src/main.py --imagen data/prueba.jpg --sin-menu    # Ejecución directa por consola
-    python src/main.py --imagen data/foto.png --quitar-fondo --relleno-espejo --sin-menu
+    python src/main.py --imagen data/foto.png --fondo auto --relleno-espejo --sin-menu
 """
 import argparse
 import os
-import sys
 import threading
 import time
 
@@ -17,6 +16,8 @@ from PIL import Image, ImageTk
 
 from fase1_slic import (
     cargar_imagen_cualquier_formato,
+    clasificar_tipo_escena,
+    estimar_punto_fuga_hough,
     procesar_superpixeles,
     segmentar_objeto_sin_fondo,
 )
@@ -33,7 +34,7 @@ def cargar_profundidad_neural(img_rgb, modo):
     except Exception as e:
         if modo == "neural":
             raise
-        print(f"[!] Red de profundidad no disponible ({type(e).__name__}: {e}). Uso modo geométrico.")
+        print(f"[i] Usando motor de profundidad universal 100% offline ({e}).")
         return None
 
 
@@ -49,13 +50,13 @@ def guardar_diagnostico(ruta_png, img_rgb, mapa_k, z_bruto, z_final, m, mascara_
         contornos, _ = cv2.findContours(mascara_fg.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         cv2.drawContours(vis_fg, contornos, -1, (0, 255, 120), 2)
         ax[0].imshow(vis_fg)
-        ax[0].set_title("1. Objeto segmentado (sin fondo)")
+        ax[0].set_title(f"1. Objeto segmentado [{m.get('tipo_escena', 'objeto')}]")
     else:
         ax[0].imshow(img_rgb)
         ax[0].axhline(m["y_horizonte"] * H, color="lime", ls="--", label="Horizonte")
         ax[0].plot(m["x_vp"] * W, m["y_horizonte"] * H, "ro", label=f"Punto fuga (conf {m['vp_confianza']})")
         ax[0].legend(loc="upper right", fontsize=7)
-        ax[0].set_title("1. Escena + punto de fuga")
+        ax[0].set_title(f"1. Escena completa [{m.get('tipo_escena', 'escena')}]")
 
     ax[1].imshow(mapa_k, cmap="tab10")
     ax[1].set_title(f"2. K-Means (K={m['k_clusters']})")
@@ -75,7 +76,7 @@ def ejecutar_pipeline(
     ruta_imagen: str,
     carpeta_salida: str = "data/salida",
     modo: str = "auto",
-    quitar_fondo: bool = True,
+    modo_fondo: str | bool = "auto",
     relleno_espejo: bool = True,
     fov: float = 60.0,
     k: int = 8,
@@ -93,13 +94,14 @@ def ejecutar_pipeline(
     os.makedirs(carpeta_salida, exist_ok=True)
     t0 = time.time()
 
-    informar("Cargando imagen, segmentando fondo y calculando superpíxeles SLIC...", 15)
+    informar("Cargando imagen, analizando tipo de escena y superpíxeles SLIC...", 15)
     img_rgb, slic_map, feats, info = procesar_superpixeles(
-        ruta_imagen, max_dim=max_dim, quitar_fondo=quitar_fondo
+        ruta_imagen, max_dim=max_dim, modo_fondo=modo_fondo
     )
     mascara_fg = info.get("mascara_fg", None)
+    tipo_escena = info.get("tipo_escena", "escena")
 
-    informar("Estimando mapa de profundidad inicial...", 40)
+    informar(f"Estimando mapa de profundidad ({tipo_escena})...", 40)
     disp = cargar_profundidad_neural(img_rgb, modo)
 
     informar("Agrupando superpíxeles (K-Means) y refinando relieve volumétrico...", 65)
@@ -160,9 +162,9 @@ def abrir_menu_principal(args_iniciales):
     from tkinter import filedialog, messagebox, ttk
 
     root = tk.Tk()
-    root.title("Generador de Modelos 3D - Menú Principal")
-    root.geometry("1040x700")
-    root.minsize(920, 620)
+    root.title("Generador Universal de Modelos 3D - Menú Principal")
+    root.geometry("1080x720")
+    root.minsize(940, 640)
     root.configure(bg="#181920")
 
     style = ttk.Style(root)
@@ -186,6 +188,8 @@ def abrir_menu_principal(args_iniciales):
     style.configure("Section.TLabel", background=BG_CARD, foreground="#60A5FA", font=("Segoe UI", 11, "bold"))
     style.configure("TCheckbutton", background=BG_CARD, foreground=FG_TEXT, font=("Segoe UI", 10))
     style.map("TCheckbutton", background=[("active", BG_CARD)])
+    style.configure("TRadiobutton", background=BG_CARD, foreground=FG_TEXT, font=("Segoe UI", 10))
+    style.map("TRadiobutton", background=[("active", BG_CARD)])
     style.configure(
         "Primary.TButton",
         background=ACCENT,
@@ -206,29 +210,29 @@ def abrir_menu_principal(args_iniciales):
     # Variables de control
     var_imagen = tk.StringVar(value=args_iniciales.imagen if os.path.exists(args_iniciales.imagen) else "")
     var_salida = tk.StringVar(value=args_iniciales.salida)
-    var_quitar_fondo = tk.BooleanVar(value=True if not args_iniciales.conservar_fondo else False)
-    var_relleno_espejo = tk.BooleanVar(value=True if not args_iniciales.sin_espejo else False)
+    var_modo_fondo = tk.StringVar(value=args_iniciales.fondo)
+    var_relleno_espejo = tk.BooleanVar(value=not args_iniciales.sin_espejo)
     var_modo = tk.StringVar(value=args_iniciales.modo)
     var_fov = tk.DoubleVar(value=args_iniciales.fov)
     var_k = tk.IntVar(value=args_iniciales.k)
     var_max_dim = tk.IntVar(value=args_iniciales.max_dim)
     var_abrir_visor = tk.BooleanVar(value=not args_iniciales.sin_visor)
-    var_estado = tk.StringVar(value="Selecciona una imagen y configura las opciones para generar el modelo 3D.")
+    var_estado = tk.StringVar(value="Selecciona una imagen (objeto, auto, casa o paisaje) para generar el modelo 3D.")
 
     # Encabezado
     header_frame = ttk.Frame(root)
-    header_frame.pack(fill="x", padx=20, pady=(16, 8))
-    ttk.Label(header_frame, text="Generador de Modelos 3D Volumétricos", style="Header.TLabel").pack(anchor="w")
+    header_frame.pack(fill="x", padx=20, pady=(14, 6))
+    ttk.Label(header_frame, text="Generador Universal de Modelos 3D (100% Offline)", style="Header.TLabel").pack(anchor="w")
     ttk.Label(
         header_frame,
-        text="Carga fotografías en cualquier formato (PNG, JPG, WEBP, BMP, TIFF), elimina el fondo y genera modelos 3D cerrados con relleno en espejo.",
+        text="Modela cualquier imagen (objetos, autos, casas, paisajes) en formatos PNG, JPG, WEBP, BMP o TIFF, con opción de quitar el fondo y relleno trasero en espejo.",
         style="SubHeader.TLabel",
     ).pack(anchor="w", pady=(2, 0))
 
-    # Contenedor central (Izquierda: Opciones | Derecha: Previsualización)
+    # Contenedor central
     main_frame = ttk.Frame(root)
     main_frame.pack(fill="both", expand=True, padx=20, pady=8)
-    main_frame.columnconfigure(0, weight=0, minsize=380)
+    main_frame.columnconfigure(0, weight=0, minsize=395)
     main_frame.columnconfigure(1, weight=1)
     main_frame.rowconfigure(0, weight=1)
 
@@ -236,10 +240,10 @@ def abrir_menu_principal(args_iniciales):
     panel_izq = ttk.Frame(main_frame, style="Card.TFrame", padding=16)
     panel_izq.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
 
-    ttk.Label(panel_izq, text="1. Selección de Fotografía", style="Section.TLabel").pack(anchor="w", pady=(0, 8))
+    ttk.Label(panel_izq, text="1. Selección de Fotografía", style="Section.TLabel").pack(anchor="w", pady=(0, 6))
 
     fila_img = ttk.Frame(panel_izq, style="Card.TFrame")
-    fila_img.pack(fill="x", pady=(0, 6))
+    fila_img.pack(fill="x", pady=(0, 4))
     entry_img = ttk.Entry(fila_img, textvariable=var_imagen, font=("Segoe UI", 9))
     entry_img.pack(side="left", fill="x", expand=True, padx=(0, 6))
 
@@ -261,41 +265,57 @@ def abrir_menu_principal(args_iniciales):
 
     ttk.Button(fila_img, text="Examinar...", style="Secondary.TButton", command=elegir_archivo).pack(side="right")
 
-    ttk.Separator(panel_izq, orient="horizontal").pack(fill="x", pady=12)
+    ttk.Separator(panel_izq, orient="horizontal").pack(fill="x", pady=10)
 
-    ttk.Label(panel_izq, text="2. Opciones de Geometría y Fondo", style="Section.TLabel").pack(anchor="w", pady=(0, 8))
+    ttk.Label(panel_izq, text="2. Manejo del Fondo y Relleno 3D", style="Section.TLabel").pack(anchor="w", pady=(0, 6))
 
-    chk_fondo = ttk.Checkbutton(
+    ttk.Radiobutton(
         panel_izq,
-        text="Quitar el fondo automáticamente (aislar objeto)",
-        variable=var_quitar_fondo,
+        text="Automático inteligente (aísla objetos/autos; conserva paisajes)",
+        variable=var_modo_fondo,
+        value="auto",
         command=lambda: actualizar_vista_previa(),
-    )
-    chk_fondo.pack(anchor="w", pady=4)
+    ).pack(anchor="w", pady=2)
+
+    ttk.Radiobutton(
+        panel_izq,
+        text="Quitar el fondo (aislar objeto / vehículo / figura)",
+        variable=var_modo_fondo,
+        value="quitar",
+        command=lambda: actualizar_vista_previa(),
+    ).pack(anchor="w", pady=2)
+
+    ttk.Radiobutton(
+        panel_izq,
+        text="Conservar el fondo (modelar paisaje / calle / casa completa)",
+        variable=var_modo_fondo,
+        value="conservar",
+        command=lambda: actualizar_vista_previa(),
+    ).pack(anchor="w", pady=(2, 8))
 
     chk_espejo = ttk.Checkbutton(
         panel_izq,
         text="Relleno automático trasero (duplicar en espejo 3D)",
         variable=var_relleno_espejo,
     )
-    chk_espejo.pack(anchor="w", pady=4)
+    chk_espejo.pack(anchor="w", pady=3)
 
     chk_visor = ttk.Checkbutton(
         panel_izq,
         text="Abrir visor 3D interactivo (Open3D) al terminar",
         variable=var_abrir_visor,
     )
-    chk_visor.pack(anchor="w", pady=4)
+    chk_visor.pack(anchor="w", pady=3)
 
-    ttk.Separator(panel_izq, orient="horizontal").pack(fill="x", pady=12)
+    ttk.Separator(panel_izq, orient="horizontal").pack(fill="x", pady=10)
 
-    ttk.Label(panel_izq, text="3. Parámetros de Reconstrucción", style="Section.TLabel").pack(anchor="w", pady=(0, 8))
+    ttk.Label(panel_izq, text="3. Parámetros de Reconstrucción", style="Section.TLabel").pack(anchor="w", pady=(0, 6))
 
     grid_params = ttk.Frame(panel_izq, style="Card.TFrame")
     grid_params.pack(fill="x")
     grid_params.columnconfigure(1, weight=1)
 
-    ttk.Label(grid_params, text="Modo de profundidad:").grid(row=0, column=0, sticky="w", pady=4, padx=(0, 8))
+    ttk.Label(grid_params, text="Modo de profundidad:").grid(row=0, column=0, sticky="w", pady=3, padx=(0, 8))
     combo_modo = ttk.Combobox(
         grid_params,
         textvariable=var_modo,
@@ -303,28 +323,28 @@ def abrir_menu_principal(args_iniciales):
         state="readonly",
         width=15,
     )
-    combo_modo.grid(row=0, column=1, sticky="ew", pady=4)
+    combo_modo.grid(row=0, column=1, sticky="ew", pady=3)
 
-    ttk.Label(grid_params, text="Clusters K-Means (K):").grid(row=1, column=0, sticky="w", pady=4, padx=(0, 8))
+    ttk.Label(grid_params, text="Clusters K-Means (K):").grid(row=1, column=0, sticky="w", pady=3, padx=(0, 8))
     spin_k = ttk.Spinbox(grid_params, from_=3, to=20, textvariable=var_k, width=10)
-    spin_k.grid(row=1, column=1, sticky="ew", pady=4)
+    spin_k.grid(row=1, column=1, sticky="ew", pady=3)
 
-    ttk.Label(grid_params, text="Campo de visión (FOV°):").grid(row=2, column=0, sticky="w", pady=4, padx=(0, 8))
+    ttk.Label(grid_params, text="Campo de visión (FOV°):").grid(row=2, column=0, sticky="w", pady=3, padx=(0, 8))
     spin_fov = ttk.Spinbox(grid_params, from_=35.0, to=100.0, increment=5.0, textvariable=var_fov, width=10)
-    spin_fov.grid(row=2, column=1, sticky="ew", pady=4)
+    spin_fov.grid(row=2, column=1, sticky="ew", pady=3)
 
-    ttk.Label(grid_params, text="Resolución máx. (px):").grid(row=3, column=0, sticky="w", pady=4, padx=(0, 8))
+    ttk.Label(grid_params, text="Resolución máx. (px):").grid(row=3, column=0, sticky="w", pady=3, padx=(0, 8))
     spin_dim = ttk.Spinbox(grid_params, from_=320, to=1024, increment=80, textvariable=var_max_dim, width=10)
-    spin_dim.grid(row=3, column=1, sticky="ew", pady=4)
+    spin_dim.grid(row=3, column=1, sticky="ew", pady=3)
 
-    ttk.Label(grid_params, text="Carpeta de salida:").grid(row=4, column=0, sticky="w", pady=4, padx=(0, 8))
+    ttk.Label(grid_params, text="Carpeta de salida:").grid(row=4, column=0, sticky="w", pady=3, padx=(0, 8))
     entry_sal = ttk.Entry(grid_params, textvariable=var_salida, font=("Segoe UI", 9))
-    entry_sal.grid(row=4, column=1, sticky="ew", pady=4)
+    entry_sal.grid(row=4, column=1, sticky="ew", pady=3)
 
-    ttk.Separator(panel_izq, orient="horizontal").pack(fill="x", pady=14)
+    ttk.Separator(panel_izq, orient="horizontal").pack(fill="x", pady=12)
 
     btn_generar = ttk.Button(panel_izq, text="Generar Modelo 3D", style="Primary.TButton")
-    btn_generar.pack(fill="x", pady=(4, 8))
+    btn_generar.pack(fill="x", pady=(2, 8))
 
     barra_progreso = ttk.Progressbar(panel_izq, orient="horizontal", mode="determinate", maximum=100)
     barra_progreso.pack(fill="x", pady=(0, 6))
@@ -332,7 +352,7 @@ def abrir_menu_principal(args_iniciales):
     lbl_estado = ttk.Label(
         panel_izq,
         textvariable=var_estado,
-        wraplength=340,
+        wraplength=360,
         foreground=FG_SUB,
         font=("Segoe UI", 9),
     )
@@ -348,7 +368,7 @@ def abrir_menu_principal(args_iniciales):
     header_der.grid(row=0, column=0, sticky="ew", pady=(0, 8))
     lbl_titulo_previa = ttk.Label(
         header_der,
-        text="Vista Previa (Original vs. Recorte de Fondo)",
+        text="Vista Previa",
         style="Section.TLabel",
     )
     lbl_titulo_previa.pack(side="left")
@@ -367,7 +387,7 @@ def abrir_menu_principal(args_iniciales):
     def mostrar_array_en_canvas(arr_rgb: np.ndarray, titulo: str | None = None):
         if titulo:
             lbl_titulo_previa.config(text=titulo)
-        cw = max(canvas_previa.winfo_width(), 520)
+        cw = max(canvas_previa.winfo_width(), 540)
         ch = max(canvas_previa.winfo_height(), 420)
         ih, iw = arr_rgb.shape[:2]
         escala = min(cw / iw, ch / ih)
@@ -385,9 +405,15 @@ def abrir_menu_principal(args_iniciales):
         try:
             img_bgr, mascara_alfa = cargar_imagen_cualquier_formato(ruta, max_dim=440)
             img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-            if var_quitar_fondo.get() or mascara_alfa is not None:
+            gris = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+            _, y_h, vp_conf = estimar_punto_fuga_hough(gris)
+            tipo_esc, rec_quitar = clasificar_tipo_escena(img_bgr, mascara_alfa, vp_conf, y_h)
+
+            mf = var_modo_fondo.get()
+            quitar = rec_quitar if mf == "auto" else (mf == "quitar")
+
+            if quitar or mascara_alfa is not None:
                 fg = segmentar_objeto_sin_fondo(img_bgr, mascara_alfa)
-                # Crear fondo damero oscuro para apreciar el recorte
                 h, w = img_rgb.shape[:2]
                 yy, xx = np.mgrid[0:h, 0:w]
                 damero = (((yy // 16) + (xx // 16)) % 2 == 0)
@@ -396,10 +422,13 @@ def abrir_menu_principal(args_iniciales):
                 combinada = np.hstack([img_rgb, recorte])
                 mostrar_array_en_canvas(
                     combinada,
-                    "Vista Previa: Imagen Original (Izq.) | Objeto sin Fondo (Der.)",
+                    f"Vista Previa [{tipo_esc.upper()}]: Original (Izq.) | Objeto Aislado sin Fondo (Der.)",
                 )
             else:
-                mostrar_array_en_canvas(img_rgb, "Vista Previa: Imagen Original (Con fondo)")
+                mostrar_array_en_canvas(
+                    img_rgb,
+                    f"Vista Previa [{tipo_esc.upper()}]: Escena Completa (se modelará terreno, estructuras y fondo)",
+                )
         except Exception as e:
             canvas_previa.config(image="", text=f"Error al previsualizar: {e}")
 
@@ -421,7 +450,7 @@ def abrir_menu_principal(args_iniciales):
                     ruta_imagen=ruta,
                     carpeta_salida=var_salida.get().strip() or "data/salida",
                     modo=var_modo.get(),
-                    quitar_fondo=var_quitar_fondo.get(),
+                    modo_fondo=var_modo_fondo.get(),
                     relleno_espejo=var_relleno_espejo.get(),
                     fov=float(var_fov.get()),
                     k=int(var_k.get()),
@@ -432,7 +461,6 @@ def abrir_menu_principal(args_iniciales):
 
                 def al_terminar():
                     btn_generar.config(state="normal")
-                    # Mostrar vistas 3D generadas (incluyendo parte trasera 180°) en el panel
                     if os.path.exists(res["ruta_vistas"]):
                         vistas_bgr = cv2.imread(res["ruta_vistas"])
                         if vistas_bgr is not None:
@@ -464,36 +492,41 @@ def abrir_menu_principal(args_iniciales):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Generador de modelos 3D a partir de una imagen.")
+    ap = argparse.ArgumentParser(description="Generador universal de modelos 3D a partir de cualquier imagen.")
     ap.add_argument("--imagen", default="data/prueba.jpg", help="Ruta de la foto (PNG, JPG, WEBP, BMP, etc.)")
     ap.add_argument("--salida", default="data/salida", help="Carpeta donde se exportará el modelo 3D")
     ap.add_argument("--modo", choices=["auto", "neural", "geometrico"], default="auto")
+    ap.add_argument("--fondo", choices=["auto", "quitar", "conservar"], default="auto",
+                    help="Modo de fondo: 'auto' (según escena), 'quitar' (aislar objeto) o 'conservar' (escena completa)")
+    ap.add_argument("--quitar-fondo", action="store_true", help="Fuerza quitar el fondo de la foto")
+    ap.add_argument("--conservar-fondo", action="store_true", help="Fuerza conservar el fondo original de la escena")
     ap.add_argument("--fov", type=float, default=60.0, help="Campo de visión horizontal (grados)")
     ap.add_argument("--k", type=int, default=8, help="Número de clusters K-Means")
     ap.add_argument("--z-lejos", type=float, default=8.0, help="Profundidad del infinito relativa a lo más cercano (=1)")
     ap.add_argument("--umbral", type=float, default=0.20, help="Corte de malla en saltos de profundidad")
     ap.add_argument("--max-dim", type=int, default=640, help="Dimensión máxima de procesamiento en píxeles")
-    ap.add_argument("--quitar-fondo", action="store_true", default=True, help="Quitar el fondo de la foto (activo por defecto)")
-    ap.add_argument("--conservar-fondo", action="store_true", help="Conservar el fondo original de la escena")
     ap.add_argument("--relleno-espejo", action="store_true", default=True, help="Duplicar el modelo por detrás en espejo (activo por defecto)")
     ap.add_argument("--sin-espejo", action="store_true", help="Generar solo la superficie frontal sin relleno trasero")
     ap.add_argument("--sin-visor", action="store_true", help="No abrir la ventana de Open3D al finalizar")
     ap.add_argument("--sin-menu", action="store_true", help="Ejecutar directamente por consola sin abrir el menú principal")
     args = ap.parse_args()
 
-    # Si no se pide --sin-menu, abrimos el Menú Principal interactivo
+    if args.quitar_fondo:
+        args.fondo = "quitar"
+    elif args.conservar_fondo:
+        args.fondo = "conservar"
+
     if not args.sin_menu:
         abrir_menu_principal(args)
         return
 
-    quitar_bg = not args.conservar_fondo
     espejo = not args.sin_espejo
 
     ejecutar_pipeline(
         ruta_imagen=args.imagen,
         carpeta_salida=args.salida,
         modo=args.modo,
-        quitar_fondo=quitar_bg,
+        modo_fondo=args.fondo,
         relleno_espejo=espejo,
         fov=args.fov,
         k=args.k,
