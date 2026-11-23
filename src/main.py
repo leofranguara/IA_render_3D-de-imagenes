@@ -2,7 +2,7 @@
 Uso (desde la carpeta raíz del proyecto):
     python src/main.py                                        # Abre el Menú Principal interactivo
     python src/main.py --imagen data/prueba.jpg --sin-menu    # Ejecución directa por consola
-    python src/main.py --imagen data/foto.png --fondo auto --relleno-espejo --sin-menu
+    python src/main.py --imagen data/foto.png --fondo auto --relleno-espejo --grosor-espejo 0.45 --sin-menu
 """
 import argparse
 import os
@@ -63,7 +63,7 @@ def guardar_diagnostico(ruta_png, img_rgb, mapa_k, z_bruto, z_final, m, mascara_
     ax[2].imshow(z_bruto, cmap="magma")
     ax[2].set_title("3. Profundidad (planos por superpíxel)")
     ax[3].imshow(z_final, cmap="magma")
-    etiqueta_espejo = " + Espejo 3D" if m.get("relleno_espejo", False) else ""
+    etiqueta_espejo = f" + Espejo ({int(m.get('grosor_espejo', 0.65) * 100)}%)" if m.get("relleno_espejo", False) else ""
     ax[3].set_title(f"4. Profundidad final [{m['modo_profundidad']}{etiqueta_espejo}]")
     for a in ax:
         a.axis("off")
@@ -78,6 +78,7 @@ def ejecutar_pipeline(
     modo: str = "auto",
     modo_fondo: str | bool = "auto",
     relleno_espejo: bool = True,
+    grosor_espejo: float = 0.65,
     fov: float = 60.0,
     k: int = 8,
     z_lejos: float = 8.0,
@@ -101,14 +102,15 @@ def ejecutar_pipeline(
     mascara_fg = info.get("mascara_fg", None)
     tipo_escena = info.get("tipo_escena", "escena")
 
-    informar(f"Estimando mapa de profundidad ({tipo_escena})...", 40)
+    informar(f"Estimando mapa de profundidad multi-pista ({tipo_escena})...", 40)
     disp = cargar_profundidad_neural(img_rgb, modo)
 
-    informar("Agrupando superpíxeles (K-Means) y refinando relieve volumétrico...", 65)
+    informar("Agrupando superpíxeles (K-Means) y separando planos de profundidad...", 65)
     mapa_k, z_bruto, z_final, m = agrupar_e_inferir_profundidad(
         img_rgb, slic_map, feats, info, n_clusters=k, disp_neural=disp
     )
     m["relleno_espejo"] = bool(relleno_espejo)
+    m["grosor_espejo"] = round(float(grosor_espejo), 2)
 
     print("\n=== MÉTRICAS Y GEOMETRÍA DE ESCENA ===")
     for clave, valor in m.items():
@@ -123,7 +125,8 @@ def ejecutar_pipeline(
         rgba_sin_fondo = np.dstack([img_rgb, (mascara_fg.astype(np.uint8) * 255)])
         Image.fromarray(rgba_sin_fondo).save(os.path.join(carpeta_salida, "sin_fondo.png"))
 
-    informar("Construyendo malla 3D" + (" con relleno espejo trasero..." if relleno_espejo else "..."), 85)
+    msg_espejo = f" con relleno espejo (grosor {int(grosor_espejo * 100)}%)..." if relleno_espejo else "..."
+    informar("Construyendo malla 3D" + msg_espejo, 85)
     malla = construir_malla_volumetrica(
         img_rgb,
         z_final,
@@ -134,6 +137,7 @@ def ejecutar_pipeline(
         umbral_discontinuidad=umbral,
         mascara_fg=mascara_fg,
         relleno_espejo=relleno_espejo,
+        grosor_espejo=grosor_espejo,
     )
 
     ruta_vistas = os.path.join(carpeta_salida, "vistas.png")
@@ -163,8 +167,8 @@ def abrir_menu_principal(args_iniciales):
 
     root = tk.Tk()
     root.title("Generador Universal de Modelos 3D - Menú Principal")
-    root.geometry("1080x720")
-    root.minsize(940, 640)
+    root.geometry("1100x760")
+    root.minsize(960, 680)
     root.configure(bg="#181920")
 
     style = ttk.Style(root)
@@ -190,6 +194,7 @@ def abrir_menu_principal(args_iniciales):
     style.map("TCheckbutton", background=[("active", BG_CARD)])
     style.configure("TRadiobutton", background=BG_CARD, foreground=FG_TEXT, font=("Segoe UI", 10))
     style.map("TRadiobutton", background=[("active", BG_CARD)])
+    style.configure("Horizontal.TScale", background=BG_CARD)
     style.configure(
         "Primary.TButton",
         background=ACCENT,
@@ -203,7 +208,7 @@ def abrir_menu_principal(args_iniciales):
         background="#343846",
         foreground=FG_TEXT,
         font=("Segoe UI", 9, "bold"),
-        padding=(10, 6),
+        padding=(8, 5),
     )
     style.map("Secondary.TButton", background=[("active", "#454A5C")])
 
@@ -212,6 +217,7 @@ def abrir_menu_principal(args_iniciales):
     var_salida = tk.StringVar(value=args_iniciales.salida)
     var_modo_fondo = tk.StringVar(value=args_iniciales.fondo)
     var_relleno_espejo = tk.BooleanVar(value=not args_iniciales.sin_espejo)
+    var_grosor_espejo = tk.DoubleVar(value=args_iniciales.grosor_espejo)
     var_modo = tk.StringVar(value=args_iniciales.modo)
     var_fov = tk.DoubleVar(value=args_iniciales.fov)
     var_k = tk.IntVar(value=args_iniciales.k)
@@ -221,26 +227,26 @@ def abrir_menu_principal(args_iniciales):
 
     # Encabezado
     header_frame = ttk.Frame(root)
-    header_frame.pack(fill="x", padx=20, pady=(14, 6))
-    ttk.Label(header_frame, text="Generador Universal de Modelos 3D (100% Offline)", style="Header.TLabel").pack(anchor="w")
+    header_frame.pack(fill="x", padx=20, pady=(12, 6))
+    ttk.Label(header_frame, text="Generador Universal de Modelos 3D", style="Header.TLabel").pack(anchor="w")
     ttk.Label(
         header_frame,
-        text="Modela cualquier imagen (objetos, autos, casas, paisajes) en formatos PNG, JPG, WEBP, BMP o TIFF, con opción de quitar el fondo y relleno trasero en espejo.",
+        text="Modela cualquier imagen (objetos, autos, casas, paisajes) con alta distinción de profundidad, opción de quitar el fondo y control de grosor en modo espejo.",
         style="SubHeader.TLabel",
     ).pack(anchor="w", pady=(2, 0))
 
     # Contenedor central
     main_frame = ttk.Frame(root)
-    main_frame.pack(fill="both", expand=True, padx=20, pady=8)
-    main_frame.columnconfigure(0, weight=0, minsize=395)
+    main_frame.pack(fill="both", expand=True, padx=20, pady=6)
+    main_frame.columnconfigure(0, weight=0, minsize=405)
     main_frame.columnconfigure(1, weight=1)
     main_frame.rowconfigure(0, weight=1)
 
     # Panel izquierdo
-    panel_izq = ttk.Frame(main_frame, style="Card.TFrame", padding=16)
+    panel_izq = ttk.Frame(main_frame, style="Card.TFrame", padding=15)
     panel_izq.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
 
-    ttk.Label(panel_izq, text="1. Selección de Fotografía", style="Section.TLabel").pack(anchor="w", pady=(0, 6))
+    ttk.Label(panel_izq, text="1. Selección de Fotografía", style="Section.TLabel").pack(anchor="w", pady=(0, 5))
 
     fila_img = ttk.Frame(panel_izq, style="Card.TFrame")
     fila_img.pack(fill="x", pady=(0, 4))
@@ -265,9 +271,9 @@ def abrir_menu_principal(args_iniciales):
 
     ttk.Button(fila_img, text="Examinar...", style="Secondary.TButton", command=elegir_archivo).pack(side="right")
 
-    ttk.Separator(panel_izq, orient="horizontal").pack(fill="x", pady=10)
+    ttk.Separator(panel_izq, orient="horizontal").pack(fill="x", pady=8)
 
-    ttk.Label(panel_izq, text="2. Manejo del Fondo y Relleno 3D", style="Section.TLabel").pack(anchor="w", pady=(0, 6))
+    ttk.Label(panel_izq, text="2. Manejo del Fondo y Modo Espejo 3D", style="Section.TLabel").pack(anchor="w", pady=(0, 5))
 
     ttk.Radiobutton(
         panel_izq,
@@ -291,31 +297,98 @@ def abrir_menu_principal(args_iniciales):
         variable=var_modo_fondo,
         value="conservar",
         command=lambda: actualizar_vista_previa(),
-    ).pack(anchor="w", pady=(2, 8))
+    ).pack(anchor="w", pady=(2, 6))
 
     chk_espejo = ttk.Checkbutton(
         panel_izq,
         text="Relleno automático trasero (duplicar en espejo 3D)",
         variable=var_relleno_espejo,
     )
-    chk_espejo.pack(anchor="w", pady=3)
+    chk_espejo.pack(anchor="w", pady=2)
+
+    # Control de grosor del modo espejo (con deslizador y botones rápidos para hacerlo menos grueso)
+    frame_grosor = ttk.Frame(panel_izq, style="Card.TFrame")
+    frame_grosor.pack(fill="x", pady=(4, 4))
+
+    fila_lbl_grosor = ttk.Frame(frame_grosor, style="Card.TFrame")
+    fila_lbl_grosor.pack(fill="x")
+    ttk.Label(fila_lbl_grosor, text="Grosor del modelo en espejo:").pack(side="left")
+    lbl_val_grosor = ttk.Label(fila_lbl_grosor, text="", foreground="#60A5FA", font=("Segoe UI", 9, "bold"))
+    lbl_val_grosor.pack(side="right")
+
+    def actualizar_etiqueta_grosor(*_):
+        v = float(var_grosor_espejo.get())
+        pct = int(round(v * 100))
+        if v <= 0.30:
+            desc = "Muy delgado"
+        elif v <= 0.52:
+            desc = "Delgado"
+        elif v <= 0.80:
+            desc = "Equilibrado"
+        elif v <= 1.10:
+            desc = "Normal"
+        else:
+            desc = "Grueso"
+        lbl_val_grosor.config(text=f"{pct}% ({desc})")
+
+    scale_grosor = ttk.Scale(
+        frame_grosor,
+        from_=0.15,
+        to=1.40,
+        orient="horizontal",
+        variable=var_grosor_espejo,
+        command=actualizar_etiqueta_grosor,
+    )
+    scale_grosor.pack(fill="x", pady=(3, 4))
+
+    fila_presets_grosor = ttk.Frame(frame_grosor, style="Card.TFrame")
+    fila_presets_grosor.pack(fill="x")
+
+    def fijar_grosor(val: float):
+        var_grosor_espejo.set(val)
+        actualizar_etiqueta_grosor()
+
+    ttk.Button(
+        fila_presets_grosor, text="Muy delgado (25%)", style="Secondary.TButton",
+        command=lambda: fijar_grosor(0.25)
+    ).pack(side="left", expand=True, fill="x", padx=(0, 3))
+    ttk.Button(
+        fila_presets_grosor, text="Delgado (45%)", style="Secondary.TButton",
+        command=lambda: fijar_grosor(0.45)
+    ).pack(side="left", expand=True, fill="x", padx=3)
+    ttk.Button(
+        fila_presets_grosor, text="Equilibrado (65%)", style="Secondary.TButton",
+        command=lambda: fijar_grosor(0.65)
+    ).pack(side="left", expand=True, fill="x", padx=3)
+    ttk.Button(
+        fila_presets_grosor, text="Normal (100%)", style="Secondary.TButton",
+        command=lambda: fijar_grosor(1.00)
+    ).pack(side="left", expand=True, fill="x", padx=(3, 0))
+
+    actualizar_etiqueta_grosor()
+
+    def al_cambiar_espejo():
+        estado_s = "normal" if var_relleno_espejo.get() else "disabled"
+        scale_grosor.configure(state=estado_s)
+
+    chk_espejo.configure(command=al_cambiar_espejo)
 
     chk_visor = ttk.Checkbutton(
         panel_izq,
         text="Abrir visor 3D interactivo (Open3D) al terminar",
         variable=var_abrir_visor,
     )
-    chk_visor.pack(anchor="w", pady=3)
+    chk_visor.pack(anchor="w", pady=(4, 2))
 
-    ttk.Separator(panel_izq, orient="horizontal").pack(fill="x", pady=10)
+    ttk.Separator(panel_izq, orient="horizontal").pack(fill="x", pady=8)
 
-    ttk.Label(panel_izq, text="3. Parámetros de Reconstrucción", style="Section.TLabel").pack(anchor="w", pady=(0, 6))
+    ttk.Label(panel_izq, text="3. Parámetros de Reconstrucción", style="Section.TLabel").pack(anchor="w", pady=(0, 5))
 
     grid_params = ttk.Frame(panel_izq, style="Card.TFrame")
     grid_params.pack(fill="x")
     grid_params.columnconfigure(1, weight=1)
 
-    ttk.Label(grid_params, text="Modo de profundidad:").grid(row=0, column=0, sticky="w", pady=3, padx=(0, 8))
+    ttk.Label(grid_params, text="Modo de profundidad:").grid(row=0, column=0, sticky="w", pady=2, padx=(0, 8))
     combo_modo = ttk.Combobox(
         grid_params,
         textvariable=var_modo,
@@ -323,36 +396,36 @@ def abrir_menu_principal(args_iniciales):
         state="readonly",
         width=15,
     )
-    combo_modo.grid(row=0, column=1, sticky="ew", pady=3)
+    combo_modo.grid(row=0, column=1, sticky="ew", pady=2)
 
-    ttk.Label(grid_params, text="Clusters K-Means (K):").grid(row=1, column=0, sticky="w", pady=3, padx=(0, 8))
+    ttk.Label(grid_params, text="Clusters K-Means (K):").grid(row=1, column=0, sticky="w", pady=2, padx=(0, 8))
     spin_k = ttk.Spinbox(grid_params, from_=3, to=20, textvariable=var_k, width=10)
-    spin_k.grid(row=1, column=1, sticky="ew", pady=3)
+    spin_k.grid(row=1, column=1, sticky="ew", pady=2)
 
-    ttk.Label(grid_params, text="Campo de visión (FOV°):").grid(row=2, column=0, sticky="w", pady=3, padx=(0, 8))
+    ttk.Label(grid_params, text="Campo de visión (FOV°):").grid(row=2, column=0, sticky="w", pady=2, padx=(0, 8))
     spin_fov = ttk.Spinbox(grid_params, from_=35.0, to=100.0, increment=5.0, textvariable=var_fov, width=10)
-    spin_fov.grid(row=2, column=1, sticky="ew", pady=3)
+    spin_fov.grid(row=2, column=1, sticky="ew", pady=2)
 
-    ttk.Label(grid_params, text="Resolución máx. (px):").grid(row=3, column=0, sticky="w", pady=3, padx=(0, 8))
+    ttk.Label(grid_params, text="Resolución máx. (px):").grid(row=3, column=0, sticky="w", pady=2, padx=(0, 8))
     spin_dim = ttk.Spinbox(grid_params, from_=320, to=1024, increment=80, textvariable=var_max_dim, width=10)
-    spin_dim.grid(row=3, column=1, sticky="ew", pady=3)
+    spin_dim.grid(row=3, column=1, sticky="ew", pady=2)
 
-    ttk.Label(grid_params, text="Carpeta de salida:").grid(row=4, column=0, sticky="w", pady=3, padx=(0, 8))
+    ttk.Label(grid_params, text="Carpeta de salida:").grid(row=4, column=0, sticky="w", pady=2, padx=(0, 8))
     entry_sal = ttk.Entry(grid_params, textvariable=var_salida, font=("Segoe UI", 9))
-    entry_sal.grid(row=4, column=1, sticky="ew", pady=3)
+    entry_sal.grid(row=4, column=1, sticky="ew", pady=2)
 
-    ttk.Separator(panel_izq, orient="horizontal").pack(fill="x", pady=12)
+    ttk.Separator(panel_izq, orient="horizontal").pack(fill="x", pady=10)
 
     btn_generar = ttk.Button(panel_izq, text="Generar Modelo 3D", style="Primary.TButton")
-    btn_generar.pack(fill="x", pady=(2, 8))
+    btn_generar.pack(fill="x", pady=(2, 6))
 
     barra_progreso = ttk.Progressbar(panel_izq, orient="horizontal", mode="determinate", maximum=100)
-    barra_progreso.pack(fill="x", pady=(0, 6))
+    barra_progreso.pack(fill="x", pady=(0, 5))
 
     lbl_estado = ttk.Label(
         panel_izq,
         textvariable=var_estado,
-        wraplength=360,
+        wraplength=370,
         foreground=FG_SUB,
         font=("Segoe UI", 9),
     )
@@ -452,6 +525,7 @@ def abrir_menu_principal(args_iniciales):
                     modo=var_modo.get(),
                     modo_fondo=var_modo_fondo.get(),
                     relleno_espejo=var_relleno_espejo.get(),
+                    grosor_espejo=float(var_grosor_espejo.get()),
                     fov=float(var_fov.get()),
                     k=int(var_k.get()),
                     max_dim=int(var_max_dim.get()),
@@ -467,7 +541,7 @@ def abrir_menu_principal(args_iniciales):
                             vistas_rgb = cv2.cvtColor(vistas_bgr, cv2.COLOR_BGR2RGB)
                             mostrar_array_en_canvas(
                                 vistas_rgb,
-                                "Resultado 3D: Vistas Multi-ángulo (Incluye Vista Trasera en Espejo)",
+                                f"Resultado 3D: Vistas Multi-ángulo (Grosor Espejo: {int(var_grosor_espejo.get() * 100)}%)",
                             )
                     if var_abrir_visor.get():
                         threading.Thread(
@@ -507,6 +581,8 @@ def main():
     ap.add_argument("--max-dim", type=int, default=640, help="Dimensión máxima de procesamiento en píxeles")
     ap.add_argument("--relleno-espejo", action="store_true", default=True, help="Duplicar el modelo por detrás en espejo (activo por defecto)")
     ap.add_argument("--sin-espejo", action="store_true", help="Generar solo la superficie frontal sin relleno trasero")
+    ap.add_argument("--grosor-espejo", type=float, default=0.65,
+                    help="Factor de grosor al duplicar en espejo (ej. 0.25 = muy delgado, 0.45 = delgado, 0.65 = equilibrado, 1.0 = normal)")
     ap.add_argument("--sin-visor", action="store_true", help="No abrir la ventana de Open3D al finalizar")
     ap.add_argument("--sin-menu", action="store_true", help="Ejecutar directamente por consola sin abrir el menú principal")
     args = ap.parse_args()
@@ -528,6 +604,7 @@ def main():
         modo=args.modo,
         modo_fondo=args.fondo,
         relleno_espejo=espejo,
+        grosor_espejo=args.grosor_espejo,
         fov=args.fov,
         k=args.k,
         z_lejos=args.z_lejos,

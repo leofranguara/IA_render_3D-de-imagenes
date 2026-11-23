@@ -30,6 +30,7 @@ def construir_malla_volumetrica(
     area_minima_px: int = 150,
     mascara_fg: np.ndarray | None = None,
     relleno_espejo: bool = True,
+    grosor_espejo: float = 0.65,
 ) -> trimesh.Trimesh:
     """
     Construye una malla 3D a partir del mapa de disparidad/profundidad:
@@ -39,36 +40,50 @@ def construir_malla_volumetrica(
         relleno en espejo trasero.
       - Si relleno_espejo=True: duplica la geometría hacia atrás como un espejo simétrico y cose
         automáticamente todos los bordes del perímetro para obtener un sólido cerrado.
+      - grosor_espejo: factor multiplicador del espesor en modo espejo (ej. 0.15 = muy delgado,
+        0.65 = equilibrado, 1.0 = normal, 1.5 = muy grueso).
     """
     img = img_rgb[::paso_malla, ::paso_malla]
     d = mapa_z[::paso_malla, ::paso_malla].astype(np.float32)
     fg = mascara_fg[::paso_malla, ::paso_malla].astype(bool) if mascara_fg is not None else None
     H, W = d.shape
+    factor_grosor = float(np.clip(grosor_espejo, 0.08, 2.0))
 
     f = 0.5 * W / np.tan(np.deg2rad(fov_grados) / 2.0)
     cx, cy = (W - 1) / 2.0, (H - 1) / 2.0
     u, v = np.meshgrid(np.arange(W, dtype=np.float32), np.arange(H, dtype=np.float32))
 
     if fg is not None and fg.any():
-        # --- MODO 1: Objeto Aislado (Auto, Fruta, Casa recortada, Persona) ---
+        # --- MODO 1: Objeto Aislado (Retrato, Auto, Fruta, Casa recortada, Persona) ---
         z_pivote = 2.2
         escala_xy = z_pivote / f
         X = (u - cx) * escala_xy
         Y = -(v - cy) * escala_xy
 
-        ys_fg, xs_fg = np.where(fg)
-        span_px = max(float(xs_fg.max() - xs_fg.min()), float(ys_fg.max() - ys_fg.min()), 32.0)
-        semiespesor_max = 0.34 * span_px * escala_xy
+        # Transformada de distancia con bordes cerrados en los 4 lados del marco
+        m_pad = np.zeros((H + 2, W + 2), dtype=np.uint8)
+        m_pad[1:-1, 1:-1] = fg.astype(np.uint8)
+        dist_cerrada = cv2.distanceTransform(m_pad, cv2.DIST_L2, 5)[1:-1, 1:-1].astype(np.float32)
+        dist_abierta = cv2.distanceTransform(fg.astype(np.uint8), cv2.DIST_L2, 5).astype(np.float32)
+        dist_px = 0.80 * dist_cerrada + 0.20 * dist_abierta
+        max_dist = max(float(dist_cerrada.max()), 1.0)
 
-        # Envolvente suave que cae a 0 en el contorno exterior para que la costura espejo sea limpia
-        dist_px = cv2.distanceTransform(fg.astype(np.uint8), cv2.DIST_L2, 5).astype(np.float32)
-        max_dist = max(float(dist_px.max()), 1.0)
-        r_borde = np.clip(dist_px / (max_dist * 0.38 + 1e-6), 0.0, 1.0)
+        # El espesor físico 3D debe ser proporcional al diámetro transversal inscrito del sujeto
+        # (evita que en retratos verticales o personas de cuerpo entero la profundidad se estire por la altura del torso)
+        ys_fg, xs_fg = np.where(fg)
+        ancho_fg = float(xs_fg.max() - xs_fg.min())
+        alto_fg = float(ys_fg.max() - ys_fg.min())
+        diametro_transversal = min(max(2.3 * max_dist, 32.0), max(min(ancho_fg, alto_fg) * 1.15, 32.0))
+        semiespesor_max = 0.34 * diametro_transversal * escala_xy * factor_grosor
+
+        # Bisel suave únicamente en el borde perimetral exterior para que la costura espejo sea limpia
+        # sin inflar artificialmente zonas que deben ir retraídas (como el cuello bajo el mentón)
+        r_borde = np.clip(dist_px / (max_dist * 0.18 + 1e-6), 0.0, 1.0)
         envolvente = np.sqrt(np.clip(2.0 * r_borde - r_borde * r_borde, 0.0, 1.0))
 
-        d_suave = cv2.bilateralFilter(d, d=7, sigmaColor=0.08, sigmaSpace=5)
-        d_norm = np.clip((d_suave - 0.15) / 0.85, 0.0, 1.0)
-        dz = semiespesor_max * (0.40 * envolvente + 0.60 * d_norm * envolvente)
+        d_suave = cv2.GaussianBlur(d, (5, 5), 0)
+        d_norm = np.clip((d_suave - 0.12) / 0.88, 0.0, 1.0)
+        dz = semiespesor_max * (0.10 * envolvente + 0.90 * d_norm * envolvente)
         dz = cv2.GaussianBlur(dz.astype(np.float32), (5, 5), 0)
         dz[~fg] = 0.0
 
@@ -81,26 +96,24 @@ def construir_malla_volumetrica(
         escala_base = z_pivote / f
 
         d_suave = cv2.bilateralFilter(d, d=7, sigmaColor=0.07, sigmaSpace=5)
-        d_suave = cv2.GaussianBlur(d_suave, (5, 5), 0)
+        d_suave = cv2.GaussianBlur(d_suave, (3, 3), 0)
 
         if relleno_espejo:
-            # Con relleno en espejo, creamos un diorama 3D volumétrico de doble cara:
-            # X,Y mantienen proporciones coherentes con leve convergencia de perspectiva (20%)
-            # y el relieve Z sobresale hacia adelante y se refleja simétricamente hacia atrás.
+            # Con relleno en espejo, creamos un diorama 3D volumétrico de doble cara con grosor ajustable:
             factor_persp = 1.0 - 0.18 * (d_suave - 0.5)
             X = (u - cx) * escala_base * factor_persp
             Y = -(v - cy) * escala_base * factor_persp
 
             span_escena = max(W, H) * escala_base
-            espesor_base = 0.035 * span_escena
-            relieve_max = 0.28 * span_escena
+            espesor_base = 0.020 * span_escena * factor_grosor
+            relieve_max = 0.26 * span_escena * factor_grosor
 
             # Atenuar ligeramente en el borde mismo del marco para un bisel limpio
             margen_x = np.minimum(u, W - 1 - u) / max(W * 0.04, 1.0)
             margen_y = np.minimum(v, H - 1 - v) / max(H * 0.04, 1.0)
             bisel_marco = np.clip(np.minimum(margen_x, margen_y), 0.15, 1.0)
 
-            dz = (espesor_base + relieve_max * (d_suave ** 1.15)) * bisel_marco
+            dz = (espesor_base + relieve_max * (d_suave ** 1.10)) * bisel_marco
             z_frente = -z_pivote + dz
             z_detras = -z_pivote - dz
 
@@ -196,6 +209,7 @@ def construir_malla_volumetrica(
         "f": float(f), "W": int(W), "H": int(H),
         "z_pivote": float(z_pivote),
         "relleno_espejo": bool(relleno_espejo),
+        "grosor_espejo": float(factor_grosor),
     })
     return malla
 

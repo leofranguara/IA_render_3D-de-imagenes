@@ -319,6 +319,116 @@ def estimar_punto_fuga_hough(img_gris: np.ndarray) -> tuple[float, float, float]
             float(np.clip(confianza, 0.0, 1.0)))
 
 
+def detectar_anatomia_retrato(img_rgb: np.ndarray, mascara_fg: np.ndarray | None = None) -> dict:
+    """
+    Detecta de forma 100% offline si el sujeto es un retrato / rostro / busto humano
+    y extrae la geometría anatómica exacta de la cabeza, mentón, mandíbula, cuello y hombros.
+    Evita falsos positivos en frutas rojas o autos exigiendo cromaticidad de piel humana
+    moderada en YCrCb+HSV, simetría bilateral y proporción antropométrica craneal.
+    """
+    H, W = img_rgb.shape[:2]
+    fg = mascara_fg if mascara_fg is not None else np.ones((H, W), dtype=bool)
+    ys_fg, xs_fg = np.where(fg)
+    if len(ys_fg) < 0.04 * H * W:
+        return {"es_retrato": False}
+
+    y_min, y_max = int(ys_fg.min()), int(ys_fg.max())
+    x_min, x_max = int(xs_fg.min()), int(xs_fg.max())
+    alto_fg = max(y_max - y_min, 1)
+    ancho_fg = max(x_max - x_min, 1)
+
+    ycrcb = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2YCrCb)
+    hsv = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2HSV)
+    Y, Cr, Cb = ycrcb[:, :, 0], ycrcb[:, :, 1], ycrcb[:, :, 2]
+    S = hsv[:, :, 1]
+    R, G, B = img_rgb[:, :, 0].astype(np.int32), img_rgb[:, :, 1].astype(np.int32), img_rgb[:, :, 2].astype(np.int32)
+
+    # Locus cromático estricto de piel humana (descarta rojos puros como fresas/autos que tienen Cr > 180 o S > 165)
+    es_piel = (
+        fg &
+        (Y > 45) & (Cr >= 133) & (Cr <= 174) &
+        (Cb >= 77) & (Cb <= 128) &
+        (S >= 18) & (S <= 155) &
+        (R > G + 5) & (R > B + 12) & ((R - G) < 95)
+    )
+
+    # Analizar zona superior-media del sujeto (donde debe ubicarse el rostro)
+    y_corte_rostro = int(y_min + 0.72 * alto_fg)
+    zona_sup = fg.copy()
+    zona_sup[y_corte_rostro:, :] = False
+    if zona_sup.sum() < 100:
+        return {"es_retrato": False}
+
+    piel_sup = es_piel & zona_sup
+    frac_piel_sup = float(piel_sup.sum()) / float(zona_sup.sum() + 1e-6)
+    if frac_piel_sup < 0.16:
+        return {"es_retrato": False}
+
+    # Perfil de ancho horizontal fila por fila de la silueta
+    ancho_fila = np.zeros(H, dtype=np.float32)
+    centro_fila = np.full(H, W * 0.5, dtype=np.float32)
+    x_izq_fila = np.zeros(H, dtype=np.float32)
+    x_der_fila = np.full(H, float(W - 1), dtype=np.float32)
+    for y in range(y_min, y_max + 1):
+        xs_r = np.where(fg[y])[0]
+        if len(xs_r) >= 4:
+            x0, x1 = float(xs_r[0]), float(xs_r[-1])
+            ancho_fila[y] = x1 - x0
+            centro_fila[y] = 0.5 * (x0 + x1)
+            x_izq_fila[y] = x0
+            x_der_fila[y] = x1
+
+    # Medir ancho y centro de la cabeza en la franja craneal/temporal (15% a 48% de la altura)
+    y_c1 = min(H - 1, int(y_min + 0.15 * alto_fg))
+    y_c2 = min(H, max(y_c1 + 2, int(y_min + 0.48 * alto_fg)))
+    anchos_craneo = ancho_fila[y_c1:y_c2]
+    validos_c = anchos_craneo > 0.10 * W
+    if validos_c.sum() < 5:
+        return {"es_retrato": False}
+
+    w_head = float(np.median(anchos_craneo[validos_c]))
+    x_mid = float(np.median(centro_fila[y_c1:y_c2][validos_c]))
+
+    # Verificar simetría bilateral de la piel del rostro respecto a x_mid
+    ys_p, xs_p = np.where(piel_sup)
+    x_piel_med = float(np.median(xs_p))
+    if abs(x_piel_med - x_mid) > 0.16 * w_head:
+        return {"es_retrato": False}
+
+    # Verificar proporción vertical: en un retrato/persona la cabeza no es una franja horizontal ancha como un auto
+    if w_head > 0.88 * W and alto_fg < 0.85 * w_head:
+        return {"es_retrato": False}
+
+    # Estimar la posición del mentón (y_chin) combinando proporción antropométrica (H_head ≈ 1.26 * W_head)
+    # y el estrechamiento del cuello antes de los hombros
+    y_chin_antropo = y_min + 1.26 * w_head
+    y_busq_1 = min(H - 1, max(y_c2, int(y_min + 0.95 * w_head)))
+    y_busq_2 = min(H, max(y_busq_1 + 3, int(y_min + 1.50 * w_head)))
+    if y_busq_2 < y_max - 10:
+        franja_cuello = ancho_fila[y_busq_1:y_busq_2]
+        y_min_cuello = y_busq_1 + int(np.argmin(franja_cuello))
+        # El mentón termina justo al inicio del estrechamiento del cuello
+        y_chin = float(np.clip(0.55 * y_chin_antropo + 0.45 * y_min_cuello, y_min + 0.95 * w_head, y_max))
+    else:
+        y_chin = float(min(y_max, y_chin_antropo))
+
+    return {
+        "es_retrato": True,
+        "y_top": float(y_min),
+        "y_chin": float(y_chin),
+        "y_max": float(y_max),
+        "x_mid": float(x_mid),
+        "w_head": float(w_head),
+        "r_x": float(0.5 * w_head),
+        "r_y": float(0.5 * max(y_chin - y_min, 20.0)),
+        "ancho_fila": ancho_fila,
+        "centro_fila": centro_fila,
+        "x_izq_fila": x_izq_fila,
+        "x_der_fila": x_der_fila,
+        "es_piel": es_piel,
+    }
+
+
 def clasificar_tipo_escena(img_bgr: np.ndarray, mascara_alfa: np.ndarray | None,
                            vp_confianza: float, y_horizonte: float) -> tuple[str, bool]:
     """
@@ -380,12 +490,17 @@ def clasificar_tipo_escena(img_bgr: np.ndarray, mascara_alfa: np.ndarray | None,
     if n_ortogonales >= 18 and (sat_centro - sat_borde < 25.0):
         return "arquitectura", False
 
-    # Probar si hay un objeto bien delimitado que no ocupe toda la foto
+    # Probar si hay un objeto o retrato bien delimitado que no ocupe toda la foto
     fg_test = segmentar_objeto_sin_fondo(img_bgr)
+    img_rgb_test = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    anat = detectar_anatomia_retrato(img_rgb_test, fg_test)
+    if anat.get("es_retrato", False):
+        return "retrato", True
+
     frac_fg = float(fg_test.mean())
     toca_bordes = float(fg_test[borde_mask].mean())
 
-    if 0.06 <= frac_fg <= 0.78 and toca_bordes < 0.35:
+    if 0.06 <= frac_fg <= 0.78 and toca_bordes < 0.38:
         return "objeto", True
 
     if n_ortogonales >= 12:
@@ -397,7 +512,7 @@ def procesar_superpixeles(ruta_imagen: str, n_segments: int = 850, compactness: 
                           max_dim: int = 640, modo_fondo: str | bool = "auto"):
     """
     modo_fondo:
-      - "auto": detecta automáticamente si conviene aislar el objeto (frutilla, auto, producto)
+      - "auto": detecta automáticamente si conviene aislar el objeto (frutilla, auto, retrato, producto)
                 o modelar la escena completa (paisaje, casa con entorno, calle).
       - True o "quitar": fuerza la eliminación del fondo para aislar el objeto principal.
       - False o "conservar": conserva toda la escena sin recortar el fondo.
@@ -427,9 +542,15 @@ def procesar_superpixeles(ruta_imagen: str, n_segments: int = 850, compactness: 
     if quitar_fondo_efectivo or mascara_alfa is not None:
         mascara_fg = segmentar_objeto_sin_fondo(img_bgr, mascara_alfa)
         vp_confianza = min(vp_confianza, 0.15)
+        anat_retrato = detectar_anatomia_retrato(img_rgb, mascara_fg)
+        if anat_retrato.get("es_retrato", False):
+            tipo_escena = "retrato"
     else:
         # También calculamos una máscara suave del sujeto principal para darle relieve extra dentro de la escena
         mascara_sujeto_escena = segmentar_objeto_sin_fondo(img_bgr, None)
+        anat_retrato = detectar_anatomia_retrato(img_rgb, mascara_sujeto_escena)
+        if anat_retrato.get("es_retrato", False):
+            tipo_escena = "retrato"
     
     # 3. Gradiente y nitidez local
     L_channel = img_lab[:, :, 0]
@@ -471,6 +592,7 @@ def procesar_superpixeles(ruta_imagen: str, n_segments: int = 850, compactness: 
         "lab_map": img_lab,
         "mascara_fg": mascara_fg,
         "mascara_sujeto_escena": mascara_sujeto_escena if mascara_fg is None else mascara_fg,
+        "anatomia_retrato": anat_retrato,
         "quitar_fondo": bool(mascara_fg is not None),
     }
     return img_rgb, etiquetas_slic, hipervectores, info_escena
