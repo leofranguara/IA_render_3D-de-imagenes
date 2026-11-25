@@ -25,20 +25,92 @@ from fase2_clustering_profundidad import agrupar_e_inferir_profundidad
 from fase3_malla_3d import construir_malla_volumetrica, guardar_vistas, visualizar_y_exportar
 
 
-def cargar_profundidad_neural(img_rgb, modo):
-    if modo == "geometrico":
-        return None
-    try:
-        from fase0_profundidad_neural import EstimadorProfundidadNeural
-        return EstimadorProfundidadNeural().estimar(img_rgb)
-    except Exception as e:
-        if modo == "neural":
-            raise
-        print(f"[i] Usando motor de profundidad universal 100% offline ({e}).")
-        return None
+def generar_imagen_slic(img_rgb: np.ndarray, slic_map: np.ndarray, mascara_fg=None) -> np.ndarray:
+    """
+    Genera una visualización clara de los superpíxeles SLIC:
+      - Izquierda: fotografía original con la malla de fronteras de cada superpíxel SLIC.
+      - Derecha: mosaico de color promedio por superpíxel (representación simplificada que alimenta a K-Means).
+    """
+    bordes = np.zeros(slic_map.shape, dtype=bool)
+    bordes[:, 1:] |= (slic_map[:, 1:] != slic_map[:, :-1])
+    bordes[1:, :] |= (slic_map[1:, :] != slic_map[:-1, :])
+
+    # Panel izquierdo: imagen original + malla SLIC en amarillo dorado de alto contraste
+    vis_izq = img_rgb.copy()
+    if mascara_fg is not None:
+        vis_izq[~mascara_fg] = (vis_izq[~mascara_fg] * 0.45).astype(np.uint8)
+    vis_izq[bordes] = (255, 215, 60)
+
+    # Panel derecho: color medio de cada superpíxel SLIC + bordes suaves
+    lab = slic_map.ravel()
+    n_sp = int(lab.max()) + 1
+    cnt = np.bincount(lab, minlength=n_sp).astype(np.float64) + 1e-9
+    colores_sp = np.zeros((n_sp, 3), dtype=np.uint8)
+    for ch in range(3):
+        medias = np.bincount(lab, weights=img_rgb[:, :, ch].ravel().astype(np.float64), minlength=n_sp) / cnt
+        colores_sp[:, ch] = np.clip(medias, 0, 255).astype(np.uint8)
+    vis_der = colores_sp[slic_map]
+    if mascara_fg is not None:
+        vis_der[~mascara_fg] = (vis_der[~mascara_fg] * 0.45).astype(np.uint8)
+    vis_der[bordes] = (28, 30, 38)
+
+    sep = np.full((img_rgb.shape[0], 4, 3), 24, dtype=np.uint8)
+    return np.hstack([vis_izq, sep, vis_der])
 
 
-def guardar_diagnostico(ruta_png, img_rgb, mapa_k, z_bruto, z_final, m, mascara_fg=None):
+def generar_imagen_kmeans(img_rgb: np.ndarray, mapa_k: np.ndarray, m: dict, mascara_fg=None) -> np.ndarray:
+    """
+    Genera una visualización clara de cómo K-Means dividió la imagen en K secciones:
+      - Izquierda: imagen original superpuesta con los colores y contornos de cada clúster.
+      - Derecha: mapa puro de secciones K-Means con bordes nítidos y etiquetas C0..CK-1.
+    """
+    paleta = np.array([
+        [31, 119, 180], [255, 127, 14], [44, 160, 44], [214, 39, 40],
+        [148, 103, 189], [140, 86, 75], [227, 119, 194], [127, 127, 127],
+        [188, 189, 34], [23, 190, 207], [174, 199, 232], [255, 187, 120],
+        [152, 223, 138], [255, 152, 150], [197, 176, 213], [196, 156, 148],
+        [247, 182, 210], [199, 199, 199], [219, 219, 141], [158, 218, 229],
+    ], dtype=np.uint8)
+
+    col_k = paleta[mapa_k % len(paleta)]
+
+    # Detectar fronteras entre secciones K-Means
+    bordes = np.zeros(mapa_k.shape, dtype=bool)
+    bordes[:, 1:] |= (mapa_k[:, 1:] != mapa_k[:, :-1])
+    bordes[1:, :] |= (mapa_k[1:, :] != mapa_k[:-1, :])
+    bordes = cv2.dilate(bordes.astype(np.uint8), np.ones((2, 2), np.uint8)) > 0
+
+    # Panel izquierdo: imagen original + tinte semitransparente de secciones + bordes
+    vis_izq = (0.55 * img_rgb.astype(np.float32) + 0.45 * col_k.astype(np.float32)).astype(np.uint8)
+    vis_izq[bordes] = (20, 22, 28)
+
+    # Panel derecho: mapa de secciones puro + bordes + etiquetas C0..CK-1 en el centroide de cada clúster
+    vis_der = col_k.copy()
+    if mascara_fg is not None:
+        vis_der[~mascara_fg] = (vis_der[~mascara_fg] * 0.45).astype(np.uint8)
+    vis_der[bordes] = (18, 20, 26)
+
+    escala_txt = max(0.45, min(img_rgb.shape[:2]) / 680.0)
+    for cid in np.unique(mapa_k):
+        mask_c = (mapa_k == cid)
+        if mascara_fg is not None and (mask_c & mascara_fg).sum() > 40:
+            mask_c = mask_c & mascara_fg
+        num_cc, labels_cc, stats_cc, centroids_cc = cv2.connectedComponentsWithStats(
+            mask_c.astype(np.uint8), connectivity=8
+        )
+        if num_cc <= 1:
+            continue
+        idx_may = 1 + int(np.argmax(stats_cc[1:, cv2.CC_STAT_AREA]))
+        cx, cy = int(round(centroids_cc[idx_may][0])), int(round(centroids_cc[idx_may][1]))
+        etiqueta = f"C{int(cid)}"
+        cv2.putText(vis_der, etiqueta, (cx - 12, cy + 5), cv2.FONT_HERSHEY_SIMPLEX, escala_txt, (15, 15, 15), 3, cv2.LINE_AA)
+        cv2.putText(vis_der, etiqueta, (cx - 12, cy + 5), cv2.FONT_HERSHEY_SIMPLEX, escala_txt, (255, 255, 255), 1, cv2.LINE_AA)
+
+    sep = np.full((img_rgb.shape[0], 4, 3), 24, dtype=np.uint8)
+    return np.hstack([vis_izq, sep, vis_der]), vis_der
+
+
+def guardar_diagnostico(ruta_png, img_rgb, mapa_k, z_bruto, z_final, m, mascara_fg=None, vis_kmeans=None):
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     fig, ax = plt.subplots(1, 4, figsize=(18, 4.5))
@@ -58,7 +130,10 @@ def guardar_diagnostico(ruta_png, img_rgb, mapa_k, z_bruto, z_final, m, mascara_
         ax[0].legend(loc="upper right", fontsize=7)
         ax[0].set_title(f"1. Escena completa [{m.get('tipo_escena', 'escena')}]")
 
-    ax[1].imshow(mapa_k, cmap="tab10")
+    if vis_kmeans is not None:
+        ax[1].imshow(vis_kmeans)
+    else:
+        ax[1].imshow(mapa_k, cmap="tab10", vmin=0, vmax=9)
     ax[1].set_title(f"2. K-Means (K={m['k_clusters']})")
     ax[2].imshow(z_bruto, cmap="magma")
     ax[2].set_title("3. Profundidad (planos por superpíxel)")
@@ -75,7 +150,6 @@ def guardar_diagnostico(ruta_png, img_rgb, mapa_k, z_bruto, z_final, m, mascara_
 def ejecutar_pipeline(
     ruta_imagen: str,
     carpeta_salida: str = "data/salida",
-    modo: str = "auto",
     modo_fondo: str | bool = "auto",
     relleno_espejo: bool = True,
     grosor_espejo: float = 0.65,
@@ -86,6 +160,7 @@ def ejecutar_pipeline(
     max_dim: int = 640,
     mostrar_visor: bool = True,
     callback_progreso=None,
+    callback_etapa=None,
 ):
     def informar(msg: str, pct: int):
         print(f"[{pct:3d}%] {msg}")
@@ -102,15 +177,32 @@ def ejecutar_pipeline(
     mascara_fg = info.get("mascara_fg", None)
     tipo_escena = info.get("tipo_escena", "escena")
 
-    informar(f"Estimando mapa de profundidad multi-pista ({tipo_escena})...", 40)
-    disp = cargar_profundidad_neural(img_rgb, modo)
-
-    informar("Agrupando superpíxeles (K-Means) y separando planos de profundidad...", 65)
+    img_slic = generar_imagen_slic(img_rgb, slic_map, mascara_fg=mascara_fg)
+    ruta_slic = os.path.join(carpeta_salida, "slic_superpixeles.png")
+    cv2.imwrite(ruta_slic, cv2.cvtColor(img_slic, cv2.COLOR_RGB2BGR))
+    if callback_etapa is not None:
+        callback_etapa(
+            "slic",
+            img_slic,
+            f"SLIC ({len(feats)} superpíxeles): Malla sobre imagen (Izq.) | Color promedio por celda (Der.)",
+        )
+    informar(f"SLIC completado ({len(feats)} superpíxeles). Aplicando K-Means (K={k})...", 45)
     mapa_k, z_bruto, z_final, m = agrupar_e_inferir_profundidad(
-        img_rgb, slic_map, feats, info, n_clusters=k, disp_neural=disp
+        img_rgb, slic_map, feats, info, n_clusters=k
     )
     m["relleno_espejo"] = bool(relleno_espejo)
     m["grosor_espejo"] = round(float(grosor_espejo), 2)
+
+    img_kmeans, vis_kmeans_der = generar_imagen_kmeans(img_rgb, mapa_k, m, mascara_fg=mascara_fg)
+    ruta_kmeans = os.path.join(carpeta_salida, "kmeans_secciones.png")
+    cv2.imwrite(ruta_kmeans, cv2.cvtColor(img_kmeans, cv2.COLOR_RGB2BGR))
+    if callback_etapa is not None:
+        callback_etapa(
+            "kmeans",
+            img_kmeans,
+            f"K-Means (K={m['k_clusters']}) — Secciones | Silueta: {m['silueta']} | DBI: {m['davies_bouldin']}",
+        )
+    informar(f"K-Means aplicado ({m['k_clusters']} secciones, Silueta={m['silueta']})...", 68)
 
     print("\n=== MÉTRICAS Y GEOMETRÍA DE ESCENA ===")
     for clave, valor in m.items():
@@ -118,7 +210,7 @@ def ejecutar_pipeline(
 
     ruta_diag = os.path.join(carpeta_salida, "diagnostico.png")
     ruta_prof = os.path.join(carpeta_salida, "profundidad.png")
-    guardar_diagnostico(ruta_diag, img_rgb, mapa_k, z_bruto, z_final, m, mascara_fg=mascara_fg)
+    guardar_diagnostico(ruta_diag, img_rgb, mapa_k, z_bruto, z_final, m, mascara_fg=mascara_fg, vis_kmeans=vis_kmeans_der)
     cv2.imwrite(ruta_prof, (z_final * 255).astype(np.uint8))
 
     if mascara_fg is not None:
@@ -138,6 +230,10 @@ def ejecutar_pipeline(
         mascara_fg=mascara_fg,
         relleno_espejo=relleno_espejo,
         grosor_espejo=grosor_espejo,
+        mapa_cavidad=info.get("mapa_cavidad", None),
+        mapa_realce=info.get("mapa_realce", None),
+        factor_plano=info.get("factor_plano", 0.0),
+        es_horizontal_34=info.get("es_horizontal_34", False),
     )
 
     ruta_vistas = os.path.join(carpeta_salida, "vistas.png")
@@ -154,6 +250,8 @@ def ejecutar_pipeline(
     return {
         "malla": malla,
         "metricas": m,
+        "ruta_slic": ruta_slic,
+        "ruta_kmeans": ruta_kmeans,
         "ruta_diag": ruta_diag,
         "ruta_vistas": ruta_vistas,
         "ruta_obj": ruta_obj,
@@ -218,7 +316,6 @@ def abrir_menu_principal(args_iniciales):
     var_modo_fondo = tk.StringVar(value=args_iniciales.fondo)
     var_relleno_espejo = tk.BooleanVar(value=not args_iniciales.sin_espejo)
     var_grosor_espejo = tk.DoubleVar(value=args_iniciales.grosor_espejo)
-    var_modo = tk.StringVar(value=args_iniciales.modo)
     var_fov = tk.DoubleVar(value=args_iniciales.fov)
     var_k = tk.IntVar(value=args_iniciales.k)
     var_max_dim = tk.IntVar(value=args_iniciales.max_dim)
@@ -388,31 +485,21 @@ def abrir_menu_principal(args_iniciales):
     grid_params.pack(fill="x")
     grid_params.columnconfigure(1, weight=1)
 
-    ttk.Label(grid_params, text="Modo de profundidad:").grid(row=0, column=0, sticky="w", pady=2, padx=(0, 8))
-    combo_modo = ttk.Combobox(
-        grid_params,
-        textvariable=var_modo,
-        values=["auto", "geometrico", "neural"],
-        state="readonly",
-        width=15,
-    )
-    combo_modo.grid(row=0, column=1, sticky="ew", pady=2)
-
-    ttk.Label(grid_params, text="Clusters K-Means (K):").grid(row=1, column=0, sticky="w", pady=2, padx=(0, 8))
+    ttk.Label(grid_params, text="Clusters K-Means (K):").grid(row=0, column=0, sticky="w", pady=2, padx=(0, 8))
     spin_k = ttk.Spinbox(grid_params, from_=3, to=20, textvariable=var_k, width=10)
-    spin_k.grid(row=1, column=1, sticky="ew", pady=2)
+    spin_k.grid(row=0, column=1, sticky="ew", pady=2)
 
-    ttk.Label(grid_params, text="Campo de visión (FOV°):").grid(row=2, column=0, sticky="w", pady=2, padx=(0, 8))
+    ttk.Label(grid_params, text="Campo de visión (FOV°):").grid(row=1, column=0, sticky="w", pady=2, padx=(0, 8))
     spin_fov = ttk.Spinbox(grid_params, from_=35.0, to=100.0, increment=5.0, textvariable=var_fov, width=10)
-    spin_fov.grid(row=2, column=1, sticky="ew", pady=2)
+    spin_fov.grid(row=1, column=1, sticky="ew", pady=2)
 
-    ttk.Label(grid_params, text="Resolución máx. (px):").grid(row=3, column=0, sticky="w", pady=2, padx=(0, 8))
+    ttk.Label(grid_params, text="Resolución máx. (px):").grid(row=2, column=0, sticky="w", pady=2, padx=(0, 8))
     spin_dim = ttk.Spinbox(grid_params, from_=320, to=1024, increment=80, textvariable=var_max_dim, width=10)
-    spin_dim.grid(row=3, column=1, sticky="ew", pady=2)
+    spin_dim.grid(row=2, column=1, sticky="ew", pady=2)
 
-    ttk.Label(grid_params, text="Carpeta de salida:").grid(row=4, column=0, sticky="w", pady=2, padx=(0, 8))
+    ttk.Label(grid_params, text="Carpeta de salida:").grid(row=3, column=0, sticky="w", pady=2, padx=(0, 8))
     entry_sal = ttk.Entry(grid_params, textvariable=var_salida, font=("Segoe UI", 9))
-    entry_sal.grid(row=4, column=1, sticky="ew", pady=2)
+    entry_sal.grid(row=3, column=1, sticky="ew", pady=2)
 
     ttk.Separator(panel_izq, orient="horizontal").pack(fill="x", pady=10)
 
@@ -445,17 +532,76 @@ def abrir_menu_principal(args_iniciales):
         style="Section.TLabel",
     )
     lbl_titulo_previa.pack(side="left")
+
+    botones_der = ttk.Frame(header_der, style="Card.TFrame")
+    botones_der.pack(side="right")
+
+    estado_preview = {"photo": None, "ultimo_res": None}
+
+    def mostrar_imagen_archivo(clave_ruta: str, titulo: str):
+        res_act = estado_preview.get("ultimo_res")
+        if not res_act:
+            return
+        ruta_f = res_act.get(clave_ruta, "")
+        if ruta_f and os.path.exists(ruta_f):
+            bgr = cv2.imread(ruta_f)
+            if bgr is not None:
+                mostrar_array_en_canvas(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB), titulo)
+
+    btn_ver_slic = ttk.Button(
+        botones_der,
+        text="SLIC",
+        style="Secondary.TButton",
+        state="disabled",
+        command=lambda: mostrar_imagen_archivo(
+            "ruta_slic",
+            f"SLIC ({estado_preview['ultimo_res']['metricas']['n_superpixeles']} superpíxeles): Malla (Izq.) | Mosaico (Der.)",
+        ),
+    )
+    btn_ver_slic.pack(side="left", padx=(0, 4))
+
+    btn_ver_kmeans = ttk.Button(
+        botones_der,
+        text="Secciones K-Means",
+        style="Secondary.TButton",
+        state="disabled",
+        command=lambda: mostrar_imagen_archivo(
+            "ruta_kmeans",
+            f"K-Means (K={estado_preview['ultimo_res']['metricas']['k_clusters']}): División en secciones",
+        ),
+    )
+    btn_ver_kmeans.pack(side="left", padx=(0, 4))
+
+    btn_ver_diag = ttk.Button(
+        botones_der,
+        text="Diagnóstico",
+        style="Secondary.TButton",
+        state="disabled",
+        command=lambda: mostrar_imagen_archivo("ruta_diag", "Diagnóstico Completo (4 Fases)"),
+    )
+    btn_ver_diag.pack(side="left", padx=(0, 4))
+
+    btn_ver_vistas = ttk.Button(
+        botones_der,
+        text="Vistas 3D",
+        style="Secondary.TButton",
+        state="disabled",
+        command=lambda: mostrar_imagen_archivo(
+            "ruta_vistas",
+            f"Resultado 3D: Vistas Multi-ángulo (Grosor Espejo: {int(var_grosor_espejo.get() * 100)}%)",
+        ),
+    )
+    btn_ver_vistas.pack(side="left", padx=(0, 4))
+
     ttk.Button(
-        header_der,
-        text="Actualizar vista previa",
+        botones_der,
+        text="Vista previa",
         style="Secondary.TButton",
         command=lambda: actualizar_vista_previa(),
-    ).pack(side="right")
+    ).pack(side="left")
 
     canvas_previa = tk.Label(panel_der, bg="#121318", fg=FG_SUB, text="Sin imagen seleccionada", font=("Segoe UI", 11))
     canvas_previa.grid(row=1, column=0, sticky="nsew")
-
-    estado_preview = {"photo": None}
 
     def mostrar_array_en_canvas(arr_rgb: np.ndarray, titulo: str | None = None):
         if titulo:
@@ -517,12 +663,15 @@ def abrir_menu_principal(args_iniciales):
         def callback_ui(msg, pct):
             root.after(0, lambda: (var_estado.set(msg), barra_progreso.configure(value=pct)))
 
+        def callback_etapa_ui(_nombre, arr_rgb, titulo):
+            copia = arr_rgb.copy()
+            root.after(0, lambda: mostrar_array_en_canvas(copia, titulo))
+
         def tarea_fondo():
             try:
                 res = ejecutar_pipeline(
                     ruta_imagen=ruta,
                     carpeta_salida=var_salida.get().strip() or "data/salida",
-                    modo=var_modo.get(),
                     modo_fondo=var_modo_fondo.get(),
                     relleno_espejo=var_relleno_espejo.get(),
                     grosor_espejo=float(var_grosor_espejo.get()),
@@ -531,10 +680,16 @@ def abrir_menu_principal(args_iniciales):
                     max_dim=int(var_max_dim.get()),
                     mostrar_visor=False,
                     callback_progreso=callback_ui,
+                    callback_etapa=callback_etapa_ui,
                 )
 
                 def al_terminar():
                     btn_generar.config(state="normal")
+                    estado_preview["ultimo_res"] = res
+                    btn_ver_slic.config(state="normal")
+                    btn_ver_kmeans.config(state="normal")
+                    btn_ver_diag.config(state="normal")
+                    btn_ver_vistas.config(state="normal")
                     if os.path.exists(res["ruta_vistas"]):
                         vistas_bgr = cv2.imread(res["ruta_vistas"])
                         if vistas_bgr is not None:
@@ -569,7 +724,6 @@ def main():
     ap = argparse.ArgumentParser(description="Generador universal de modelos 3D a partir de cualquier imagen.")
     ap.add_argument("--imagen", default="data/prueba.jpg", help="Ruta de la foto (PNG, JPG, WEBP, BMP, etc.)")
     ap.add_argument("--salida", default="data/salida", help="Carpeta donde se exportará el modelo 3D")
-    ap.add_argument("--modo", choices=["auto", "neural", "geometrico"], default="auto")
     ap.add_argument("--fondo", choices=["auto", "quitar", "conservar"], default="auto",
                     help="Modo de fondo: 'auto' (según escena), 'quitar' (aislar objeto) o 'conservar' (escena completa)")
     ap.add_argument("--quitar-fondo", action="store_true", help="Fuerza quitar el fondo de la foto")
@@ -601,7 +755,6 @@ def main():
     ejecutar_pipeline(
         ruta_imagen=args.imagen,
         carpeta_salida=args.salida,
-        modo=args.modo,
         modo_fondo=args.fondo,
         relleno_espejo=espejo,
         grosor_espejo=args.grosor_espejo,

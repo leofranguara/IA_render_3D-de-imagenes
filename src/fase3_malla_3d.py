@@ -31,6 +31,10 @@ def construir_malla_volumetrica(
     mascara_fg: np.ndarray | None = None,
     relleno_espejo: bool = True,
     grosor_espejo: float = 0.65,
+    mapa_cavidad: np.ndarray | None = None,
+    mapa_realce: np.ndarray | None = None,
+    factor_plano: float = 0.0,
+    es_horizontal_34: bool = False,
 ) -> trimesh.Trimesh:
     """
     Construye una malla 3D a partir del mapa de disparidad/profundidad:
@@ -74,20 +78,53 @@ def construir_malla_volumetrica(
         ancho_fg = float(xs_fg.max() - xs_fg.min())
         alto_fg = float(ys_fg.max() - ys_fg.min())
         diametro_transversal = min(max(2.3 * max_dist, 32.0), max(min(ancho_fg, alto_fg) * 1.15, 32.0))
-        semiespesor_max = 0.34 * diametro_transversal * escala_xy * factor_grosor
+        es_plano = factor_plano >= 0.70
+        if es_plano:
+            coef_espesor = 0.24
+        elif es_horizontal_34:
+            coef_espesor = 0.32
+        else:
+            coef_espesor = 0.48
+        semiespesor_max = coef_espesor * diametro_transversal * escala_xy * factor_grosor
 
-        # Bisel suave únicamente en el borde perimetral exterior para que la costura espejo sea limpia
-        # sin inflar artificialmente zonas que deben ir retraídas (como el cuello bajo el mentón)
-        r_borde = np.clip(dist_px / (max_dist * 0.18 + 1e-6), 0.0, 1.0)
+        # Bisel corto para piezas rígidas/planas (aristas nítidas) o bisel suave para objetos curvos
+        if es_plano:
+            frac_bisel = 0.05
+        elif es_horizontal_34:
+            frac_bisel = 0.12
+        else:
+            frac_bisel = 0.18
+        r_borde = np.clip(dist_px / (max_dist * frac_bisel + 1e-6), 0.0, 1.0)
         envolvente = np.sqrt(np.clip(2.0 * r_borde - r_borde * r_borde, 0.0, 1.0))
 
-        d_suave = cv2.GaussianBlur(d, (5, 5), 0)
+        k_blur = (3, 3) if es_plano else (5, 5)
+        d_suave = cv2.GaussianBlur(d, k_blur, 0)
         d_norm = np.clip((d_suave - 0.12) / 0.88, 0.0, 1.0)
         dz = semiespesor_max * (0.10 * envolvente + 0.90 * d_norm * envolvente)
-        dz = cv2.GaussianBlur(dz.astype(np.float32), (5, 5), 0)
+        dz = cv2.GaussianBlur(dz.astype(np.float32), k_blur, 0)
         dz[~fg] = 0.0
 
-        z_frente = -z_pivote + dz
+        # Extrusión frontal de boquillas/tubos salientes (sobresale solo por delante, sin deformar la espalda)
+        dz_frente = dz.copy()
+        if mapa_realce is not None:
+            realce = mapa_realce[::paso_malla, ::paso_malla].astype(np.float32)
+            realce = cv2.GaussianBlur(realce, (5, 5), 0)
+            borde_suave = np.sqrt(np.clip(envolvente * 2.5, 0.0, 1.0))
+            dz_frente = np.where(
+                fg,
+                dz_frente + semiespesor_max * 0.75 * realce * borde_suave,
+                0.0,
+            ).astype(np.float32)
+
+        # Si existe una cavidad interior (ej. boca de un jarrón o conducto de boquilla), hundir solo la cara frontal
+        # manteniendo la pared trasera convexa para conservar el volumen exterior sin atravesar la malla
+        if mapa_cavidad is not None:
+            cav = mapa_cavidad[::paso_malla, ::paso_malla].astype(np.float32)
+            cav = cv2.GaussianBlur(cav, (5, 5), 0)
+            prof_hueco = semiespesor_max * 1.15 * cav
+            dz_frente = np.where(fg, np.maximum(dz_frente - prof_hueco, -dz * 0.72), 0.0).astype(np.float32)
+
+        z_frente = -z_pivote + dz_frente
         z_detras = -z_pivote - dz
         valido = fg[:-1, :-1] & fg[:-1, 1:] & fg[1:, :-1] & fg[1:, 1:]
     else:

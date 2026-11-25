@@ -50,6 +50,37 @@ def cargar_imagen_cualquier_formato(ruta_imagen: str, max_dim: int = 640) -> tup
     return img_bgr, mascara_alfa
 
 
+def _rellenar_huecos_preservando_aberturas(
+    mascara: np.ndarray,
+    dist_min_bg: np.ndarray | None = None,
+    frac_min_hueco: float = 0.0025,
+) -> np.ndarray:
+    """
+    Rellena únicamente huecos diminutos de ruido dentro de la máscara, preservando
+    agujeros pasantes reales (ej. perforaciones en piezas mecánicas, asas o anillos).
+    """
+    rellena = ndi.binary_fill_holes(mascara)
+    huecos = rellena & (~mascara)
+    if not huecos.any():
+        return mascara
+
+    area_fg = max(int(mascara.sum()), 1)
+    area_min_real = max(35, int(frac_min_hueco * area_fg))
+    num_h, labels_h, stats_h, _ = cv2.connectedComponentsWithStats(huecos.astype(np.uint8), connectivity=8)
+
+    out = rellena.copy()
+    for idx_h in range(1, num_h):
+        area_h = int(stats_h[idx_h, cv2.CC_STAT_AREA])
+        if area_h < area_min_real:
+            continue
+        comp = (labels_h == idx_h)
+        # Si proviene de canal alfa (dist_min_bg=None) o el color del hueco coincide con el fondo exterior,
+        # conservarlo como agujero pasante real.
+        if dist_min_bg is None or float(np.median(dist_min_bg[comp])) < 2.2:
+            out[comp] = False
+    return out
+
+
 def segmentar_objeto_sin_fondo(img_bgr: np.ndarray, mascara_alfa: np.ndarray | None = None) -> np.ndarray:
     """
     Segmentación universal de objeto en primer plano 100% offline.
@@ -60,11 +91,11 @@ def segmentar_objeto_sin_fondo(img_bgr: np.ndarray, mascara_alfa: np.ndarray | N
       2. Detección y descarte de sombras proyectadas en el suelo/mesa.
       3. Recuperación de partes oscuras internas del objeto (ruedas/llantas de autos, ventanas,
          parabrisas, parrillas) mediante geometría de arcos inferiores y envolvente local.
-      4. Refinamiento de bordes exactos con GrabCut y filtrado guiado.
+      4. Refinamiento de bordes exactos con GrabCut y preservación de agujeros pasantes reales.
     """
     if mascara_alfa is not None:
         m = cv2.morphologyEx(mascara_alfa.astype(np.uint8), cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8)) > 0
-        return ndi.binary_fill_holes(m)
+        return _rellenar_huecos_preservando_aberturas(m, dist_min_bg=None, frac_min_hueco=0.0020)
 
     h, w = img_bgr.shape[:2]
     img_suave = cv2.GaussianBlur(img_bgr, (5, 5), 0)
@@ -240,9 +271,9 @@ def segmentar_objeto_sin_fondo(img_bgr: np.ndarray, mascara_alfa: np.ndarray | N
 
     mascara = cv2.morphologyEx(
         mascara.astype(np.uint8), cv2.MORPH_CLOSE,
-        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     ) > 0
-    mascara = ndi.binary_fill_holes(mascara)
+    mascara = _rellenar_huecos_preservando_aberturas(mascara, dist_min_bg=dist_min_bg, frac_min_hueco=0.0025)
 
     if mascara.sum() < 0.02 * h * w:
         return np.ones((h, w), dtype=bool)
@@ -397,6 +428,21 @@ def detectar_anatomia_retrato(img_rgb: np.ndarray, mascara_fg: np.ndarray | None
 
     # Verificar proporción vertical: en un retrato/persona la cabeza no es una franja horizontal ancha como un auto
     if w_head > 0.88 * W and alto_fg < 0.85 * w_head:
+        return {"es_retrato": False}
+
+    # Verificar geometría craneal vs recipiente (jarrones/tazas tienen borde superior ancho y plano)
+    y_corona = min(H - 1, int(y_min + 0.03 * alto_fg))
+    if ancho_fila[y_corona] > 0.68 * w_head:
+        return {"es_retrato": False}
+
+    # Verificar que exista una región continua y limpia de piel facial (descarta texturas/cerámica moteada)
+    piel_u8 = piel_sup.astype(np.uint8)
+    piel_limpia = cv2.morphologyEx(piel_u8, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+    num_p, _, stats_p, _ = cv2.connectedComponentsWithStats(piel_limpia, connectivity=8)
+    if num_p <= 1:
+        return {"es_retrato": False}
+    max_area_piel = int(stats_p[1:, cv2.CC_STAT_AREA].max())
+    if max_area_piel < 0.12 * float(zona_sup.sum()):
         return {"es_retrato": False}
 
     # Estimar la posición del mentón (y_chin) combinando proporción antropométrica (H_head ≈ 1.26 * W_head)

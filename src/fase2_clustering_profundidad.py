@@ -313,6 +313,415 @@ def _profundidad_anatomica_retrato(
 # --------------------------------------------------------------------------------------
 # 1B. Modelo Volumétrico Invariante al Albedo para Objetos, Vehículos, Frutas y Animales
 # --------------------------------------------------------------------------------------
+def _perfil_revolucion_objeto(mascara_fg: np.ndarray) -> tuple[np.ndarray, float]:
+    """
+    Calcula un perfil volumétrico cilíndrico/de revolución por fila horizontal a partir de la
+    silueta del objeto y estima su grado de simetría izquierda-derecha (IoU).
+    Ideal para jarrones, botellas, tazas, frutas y objetos axialmente simétricos.
+    """
+    H, W = mascara_fg.shape
+    ys_fg, xs_fg = np.where(mascara_fg)
+    if len(ys_fg) < 20:
+        return np.zeros((H, W), dtype=np.float32), 0.0
+
+    y_min, y_max = int(ys_fg.min()), int(ys_fg.max())
+    x_min, x_max = int(xs_fg.min()), int(xs_fg.max())
+
+    # Simetría horizontal (IoU con el reflejo izquierda-derecha del recorte)
+    recorte = mascara_fg[y_min:y_max + 1, x_min:x_max + 1]
+    inter = float((recorte & recorte[:, ::-1]).sum())
+    union = float((recorte | recorte[:, ::-1]).sum()) + 1e-6
+    simetria_lr = inter / union
+
+    hay_fila = mascara_fg.any(axis=1)
+    filas_validas = np.where(hay_fila)[0]
+    x_izq = np.argmax(mascara_fg, axis=1).astype(np.float32)
+    x_der = (W - 1 - np.argmax(mascara_fg[:, ::-1], axis=1)).astype(np.float32)
+
+    # Interpolar y suavizar los perfiles de ancho y centro para evitar bandas horizontales
+    x_izq_s = np.interp(np.arange(H), filas_validas, x_izq[filas_validas])
+    x_der_s = np.interp(np.arange(H), filas_validas, x_der[filas_validas])
+    k_suave = max(5, (int(0.05 * (y_max - y_min + 1)) | 1))
+    x_izq_s = cv2.GaussianBlur(x_izq_s.reshape(H, 1), (1, k_suave), 0).ravel()
+    x_der_s = cv2.GaussianBlur(x_der_s.reshape(H, 1), (1, k_suave), 0).ravel()
+
+    radio_fila = np.maximum(0.5 * (x_der_s - x_izq_s), 1.0)
+    centro_fila = 0.5 * (x_izq_s + x_der_s)
+    r_max = max(float(radio_fila[filas_validas].max()), 1.0)
+
+    xs = np.arange(W, dtype=np.float32)[None, :]
+    u_rel = (xs - centro_fila[:, None]) / radio_fila[:, None]
+    perfil = (radio_fila[:, None] / r_max) * np.sqrt(np.clip(1.0 - u_rel * u_rel, 0.0, 1.0))
+    perfil[~mascara_fg] = 0.0
+    perfil = cv2.GaussianBlur(perfil.astype(np.float32), (5, 5), 0)
+    if perfil[mascara_fg].max() > 1e-6:
+        perfil = np.where(mascara_fg, perfil / float(perfil[mascara_fg].max()), 0.0).astype(np.float32)
+    return perfil, simetria_lr
+
+
+def _detectar_cavidad_superior(
+    img_lab: np.ndarray,
+    grad_map: np.ndarray,
+    mascara_fg: np.ndarray,
+) -> np.ndarray:
+    """
+    Detecta de forma no supervisada una abertura/cavidad cóncava en la parte superior de
+    recipientes (jarrones, tazas, cuencos, macetas) buscando un arco de labio frontal que
+    delimita una región elíptica interior más sombreada debajo del borde superior.
+    Devuelve un mapa en [0, 1] con la profundidad relativa del hueco (0 si no hay cavidad).
+    """
+    H, W = mascara_fg.shape
+    vacio = np.zeros((H, W), dtype=np.float32)
+    ys_fg, xs_fg = np.where(mascara_fg)
+    if len(ys_fg) < 100:
+        return vacio
+
+    y_min, y_max = int(ys_fg.min()), int(ys_fg.max())
+    x_min, x_max = int(xs_fg.min()), int(xs_fg.max())
+    alto_obj = y_max - y_min + 1
+    ancho_obj = x_max - x_min + 1
+    if alto_obj < 40 or ancho_obj < 40:
+        return vacio
+
+    # Verificar simetría horizontal del objeto (recipientes como jarrones, tazas y cuencos son simétricos)
+    recorte = mascara_fg[y_min:y_max + 1, x_min:x_max + 1]
+    simetria_lr = float((recorte & recorte[:, ::-1]).sum()) / (float((recorte | recorte[:, ::-1]).sum()) + 1e-6)
+    if simetria_lr < 0.72:
+        return vacio
+
+    # Verificar que exista una boca superior ancha (no una punta afilada o tallo)
+    y_probe = min(H - 1, y_min + max(3, int(0.06 * alto_obj)))
+    xs_boca = np.where(mascara_fg[y_probe])[0]
+    if len(xs_boca) < 0.28 * ancho_obj:
+        return vacio
+
+    x_b_min, x_b_max = int(xs_boca.min()), int(xs_boca.max())
+    ancho_boca = x_b_max - x_b_min + 1
+    cx_boca = 0.5 * (x_b_min + x_b_max)
+    # La boca debe estar razonablemente centrada respecto al objeto
+    if abs(cx_boca - 0.5 * (x_min + x_max)) > 0.16 * ancho_obj:
+        return vacio
+
+    L = cv2.GaussianBlur(img_lab[:, :, 0].astype(np.float32) / 255.0, (5, 5), 0)
+    gy = cv2.Sobel(L, cv2.CV_32F, 0, 1, ksize=3)
+    # El labio frontal genera una transición vertical fuerte (interior sombreado -> borde iluminado)
+    borde_lip = np.maximum(gy, 0.0) + 0.45 * np.abs(gy)
+    borde_lip = cv2.GaussianBlur(borde_lip, (11, 3), 0)
+
+    margen_x = max(3, int(0.10 * ancho_boca))
+    c_ini = x_b_min + margen_x
+    c_fin = x_b_max - margen_x
+    if c_fin - c_ini < 12:
+        return vacio
+
+    y_banda_max = min(H - 1, y_min + int(0.22 * alto_obj))
+    min_prof_px = max(3, int(0.03 * alto_obj))
+    max_prof_px = max(min_prof_px + 4, int(0.18 * alto_obj))
+
+    cols_det = []
+    y_top_det = []
+    y_lip_det = []
+    fuerza_det = []
+
+    for x in range(c_ini, c_fin + 1):
+        col_fg = np.where(mascara_fg[y_min:y_banda_max + 1, x])[0]
+        if len(col_fg) < min_prof_px + 2:
+            continue
+        yt = y_min + int(col_fg[0])
+        s0 = min(H - 1, yt + min_prof_px)
+        s1 = min(y_banda_max + 1, yt + max_prof_px)
+        if s1 <= s0 + 2:
+            continue
+        tramo = borde_lip[s0:s1, x]
+        idx_max = int(np.argmax(tramo))
+        val_max = float(tramo[idx_max])
+        if val_max >= 0.035:
+            cols_det.append(x)
+            y_top_det.append(yt)
+            y_lip_det.append(s0 + idx_max)
+            fuerza_det.append(val_max)
+
+    if len(cols_det) < max(10, int(0.45 * (c_fin - c_ini + 1))):
+        return vacio
+
+    cols_arr = np.array(cols_det, dtype=np.float32)
+    y_top_arr = np.array(y_top_det, dtype=np.float32)
+    y_lip_arr = np.array(y_lip_det, dtype=np.float32)
+    w_arr = np.array(fuerza_det, dtype=np.float32)
+
+    # Ajustar una parábola suave al arco del labio frontal (y_lip en función de x)
+    xn = (cols_arr - cx_boca) / max(0.5 * ancho_boca, 1.0)
+    coef = np.polyfit(xn, y_lip_arr, 2, w=w_arr)
+    # Descartar si el arco se curva bruscamente hacia arriba (no corresponde a una elipse vista desde arriba)
+    if coef[0] > 0.12 * alto_obj:
+        return vacio
+
+    # Reconstruir la curva del labio y del borde superior en todo el ancho de la boca
+    xs_all = np.arange(x_b_min, x_b_max + 1, dtype=np.float32)
+    xn_all = (xs_all - cx_boca) / max(0.5 * ancho_boca, 1.0)
+    y_lip_curva = np.polyval(coef, xn_all)
+
+    y_top_curva = np.full_like(xs_all, float(y_min))
+    for i, x in enumerate(xs_all.astype(int)):
+        col_fg = np.where(mascara_fg[y_min:y_banda_max + 1, x])[0]
+        if len(col_fg) > 0:
+            y_top_curva[i] = float(y_min + int(col_fg[0]))
+    y_top_curva = cv2.GaussianBlur(y_top_curva.reshape(1, -1), (9, 1), 0).ravel()
+
+    # El borde superior de una boca/abertura es casi horizontal (no una silueta inclinada)
+    if float(np.std(y_top_curva)) > 0.04 * alto_obj:
+        return vacio
+
+    alturas = y_lip_curva - y_top_curva
+    h_med = float(np.median(alturas))
+    if h_med < 0.03 * alto_obj or h_med > 0.19 * alto_obj:
+        return vacio
+    # Una abertura circular en perspectiva es una elipse horizontal más ancha que alta
+    if ancho_boca < 1.8 * h_med:
+        return vacio
+
+    # Validar contraste fotométrico: el interior de la boca debe estar más sombreado/oscuro que el labio
+    mascara_int = np.zeros((H, W), dtype=bool)
+    mascara_labio = np.zeros((H, W), dtype=bool)
+    for i, x in enumerate(xs_all.astype(int)):
+        if x < c_ini or x > c_fin:
+            continue
+        yt = int(round(y_top_curva[i])) + 2
+        yl = int(round(y_lip_curva[i]))
+        if yl > yt + 1:
+            mascara_int[yt:yl, x] = True
+            l0 = max(0, yl - 1)
+            l1 = min(H, yl + max(3, int(0.025 * alto_obj)))
+            mascara_labio[l0:l1, x] = True
+
+    mascara_int &= mascara_fg
+    mascara_labio &= mascara_fg
+    if mascara_int.sum() < 25 or mascara_labio.sum() < 15:
+        return vacio
+
+    L_int = float(np.median(L[mascara_int]))
+    L_labio = float(np.median(L[mascara_labio]))
+    fuerza_media = float(np.mean(w_arr))
+    # Evitar falsos positivos en zonas muy claras (reflejos blancos) o sin borde de labio real
+    if L_int > 0.78 or fuerza_media < 0.055:
+        return vacio
+    if L_int > L_labio + 0.03:
+        return vacio
+
+    # Construir mapa suave de profundidad cóncava [0, 1] dentro de la elipse de la boca
+    mapa_cav = np.zeros((H, W), dtype=np.float32)
+    rx = max(0.5 * ancho_boca * 0.90, 1.0)
+    for i, x in enumerate(xs_all.astype(int)):
+        tx = (float(x) - cx_boca) / rx
+        if abs(tx) >= 1.0:
+            continue
+        yt = y_top_curva[i] + 1.5
+        yl = y_lip_curva[i]
+        span = yl - yt
+        if span <= 2.0:
+            continue
+        y0 = max(0, int(np.floor(yt)))
+        y1 = min(H, int(np.ceil(yl)))
+        ys = np.arange(y0, y1, dtype=np.float32)
+        ty = np.clip((ys - yt) / span, 0.0, 1.0)
+        # Perfil cóncavo suave: 0 en los bordes del labio y máximo hacia el interior central
+        prof_col = np.sin(np.pi * ty) * np.sqrt(max(0.0, 1.0 - tx * tx))
+        mapa_cav[y0:y1, x] = np.maximum(mapa_cav[y0:y1, x], prof_col)
+
+    mapa_cav[~mascara_fg] = 0.0
+    mapa_cav = cv2.GaussianBlur(mapa_cav, (7, 7), 0)
+    if mapa_cav.max() > 1e-6:
+        mapa_cav = np.clip(mapa_cav / float(mapa_cav.max()), 0.0, 1.0)
+    return mapa_cav.astype(np.float32)
+
+
+def _detectar_boquilla_frontal(
+    img_lab: np.ndarray,
+    grad_map: np.ndarray,
+    mascara_fg: np.ndarray,
+) -> tuple[np.ndarray | None, np.ndarray | None]:
+    """
+    Detecta de forma no supervisada una boca/boquilla cilíndrica frontal que sobresale hacia
+    la cámara (ej. toma de aire de un turbo, lente, tubería o conducto):
+      - Un interior oscuro compacto y casi circular/elíptico (el conducto hueco).
+      - Rodeado por un collarín/anillo más luminoso dentro del objeto (el borde que sobresale).
+    Devuelve (mapa_realce_anillo en [0, 1], mapa_cavidad_interior en [0, 1]) o (None, None).
+    """
+    H, W = mascara_fg.shape
+    area_fg = int(mascara_fg.sum())
+    if area_fg < 400:
+        return None, None
+
+    L = cv2.GaussianBlur(img_lab[:, :, 0].astype(np.float32) / 255.0, (5, 5), 0)
+    vals_L = L[mascara_fg]
+    # Regiones muy oscuras dentro del objeto (posible interior de conducto)
+    umbral_osc = min(0.32, float(np.percentile(vals_L, 26)))
+    oscuro = mascara_fg & (L <= umbral_osc)
+    oscuro = cv2.morphologyEx(oscuro.astype(np.uint8), cv2.MORPH_OPEN, np.ones((5, 5), np.uint8)) > 0
+    oscuro = cv2.morphologyEx(oscuro.astype(np.uint8), cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8)) > 0
+
+    contornos, _ = cv2.findContours(oscuro.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contornos:
+        return None, None
+
+    ys_grid, xs_grid = np.mgrid[0:H, 0:W].astype(np.float32)
+    mapa_realce = np.zeros((H, W), dtype=np.float32)
+    mapa_cav = np.zeros((H, W), dtype=np.float32)
+    detectado = False
+
+    for cnt in contornos:
+        area = float(cv2.contourArea(cnt))
+        frac = area / float(area_fg)
+        if frac < 0.012 or frac > 0.16:
+            continue
+        perim = float(cv2.arcLength(cnt, True))
+        if perim < 1e-3:
+            continue
+        circularidad = 4.0 * np.pi * area / (perim * perim)
+        if circularidad < 0.52:
+            continue
+
+        x, y, bw, bh = cv2.boundingRect(cnt)
+        aspecto = max(bw, bh) / max(min(bw, bh), 1.0)
+        if aspecto > 1.75:
+            continue
+
+        mask_hueco = np.zeros((H, W), dtype=np.uint8)
+        cv2.drawContours(mask_hueco, [cnt], -1, 1, thickness=-1)
+        hueco_b = mask_hueco > 0
+
+        r_eq = float(np.sqrt(area / np.pi))
+        k_anillo = max(7, int(round(r_eq * 0.90)) | 1)
+        anillo = (cv2.dilate(mask_hueco, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_anillo, k_anillo))) > 0) & (~hueco_b)
+        anillo_fg = anillo & mascara_fg
+        # El collarín debe rodear mayoritariamente al hueco dentro del objeto (descarta esquinas o ruedas)
+        if anillo_fg.sum() < 0.65 * max(anillo.sum(), 1):
+            continue
+
+        L_hueco = float(np.median(L[hueco_b]))
+        L_anillo = float(np.median(L[anillo_fg]))
+        grad_borde = float(np.mean(grad_map[anillo_fg]))
+        if L_anillo < 0.48 or (L_anillo - L_hueco) < 0.22 or grad_borde < 0.10:
+            continue
+
+        # Boquilla frontal confirmada: elevar el collarín hacia afuera y hundir el conducto interior
+        detectado = True
+        cx = x + 0.5 * bw
+        cy = y + 0.5 * bh
+        rx = max(0.5 * bw, 4.0)
+        ry = max(0.5 * bh, 4.0)
+        r_norm = np.hypot((xs_grid - cx) / rx, (ys_grid - cy) / ry)
+
+        # Realce suave del tubo/collarín que sobresale (máximo sobre el anillo en r_norm ≈ 1.0..1.5)
+        realce_local = np.exp(-0.5 * ((np.maximum(r_norm - 1.15, 0.0)) / 0.65) ** 2)
+        realce_local = np.where(r_norm < 0.92, realce_local * np.clip(r_norm / 0.92, 0.0, 1.0), realce_local)
+        mapa_realce = np.maximum(mapa_realce, realce_local.astype(np.float32))
+
+        # Cavidad profunda dentro del orificio (máxima en el centro del hueco)
+        cav_local = np.sqrt(np.clip(1.0 - (r_norm / 0.98) ** 2, 0.0, 1.0))
+        cav_local = np.where(hueco_b, cav_local, 0.0)
+        mapa_cav = np.maximum(mapa_cav, cav_local.astype(np.float32))
+
+    if not detectado:
+        return None, None
+
+    mapa_realce = cv2.GaussianBlur(np.where(mascara_fg, mapa_realce, 0.0).astype(np.float32), (9, 9), 0)
+    mapa_cav = cv2.GaussianBlur(np.where(mascara_fg, mapa_cav, 0.0).astype(np.float32), (5, 5), 0)
+    if mapa_realce.max() > 1e-6:
+        mapa_realce = np.clip(mapa_realce / float(mapa_realce.max()), 0.0, 1.0)
+    if mapa_cav.max() > 1e-6:
+        mapa_cav = np.clip(mapa_cav / float(mapa_cav.max()), 0.0, 1.0)
+    return mapa_realce, mapa_cav
+
+
+def _detectar_objeto_plano_extruido(
+    img_lab: np.ndarray,
+    grad_map: np.ndarray,
+    mascara_fg: np.ndarray,
+    mapa_clusters: np.ndarray,
+) -> tuple[float, np.ndarray | None, np.ndarray | None]:
+    """
+    Detecta de forma 100% no supervisada (usando los clústeres de K-Means + planitud de luminancia
+    + presencia de agujeros pasantes) si el objeto es una pieza mecánica / rígida de caras planas
+    extruidas (ej. soportes, placas, engranajes) en lugar de un cuerpo orgánico/esférico.
+
+    Devuelve (factor_plano en [0, 1], perfil_meseta o None, mapa_agujeros_ciegos o None).
+    """
+    area_fg = int(mascara_fg.sum())
+    if area_fg < 200:
+        return 0.0, None, None
+
+    L = img_lab[:, :, 0].astype(np.float32) / 255.0
+    clusters_fg = mapa_clusters[mascara_fg]
+    ids, conteos = np.unique(clusters_fg, return_counts=True)
+    idx_dom = int(np.argmax(conteos))
+    c_dom = int(ids[idx_dom])
+    frac_dom = float(conteos[idx_dom]) / float(area_fg)
+
+    mask_dom = mascara_fg & (mapa_clusters == c_dom)
+    std_L_dom = float(np.std(L[mask_dom]))
+    grad_dom = float(np.median(grad_map[mask_dom]))
+    L_dom = float(np.median(L[mask_dom]))
+
+    # Verificar si la máscara contiene agujeros pasantes reales (fuerte indicador de pieza rígida/mecánica)
+    huecos_pasantes = ndi.binary_fill_holes(mascara_fg) & (~mascara_fg)
+    tiene_huecos = int(huecos_pasantes.sum()) > max(40, int(0.005 * area_fg))
+
+    es_plano = (
+        (frac_dom >= 0.45 and std_L_dom <= 0.075 and grad_dom <= 0.085) or
+        (tiene_huecos and frac_dom >= 0.38 and std_L_dom <= 0.095 and grad_dom <= 0.11)
+    )
+    if not es_plano:
+        return 0.0, None, None
+
+    # Calcular factor de planitud suave en [0.70, 1.0]
+    score_planitud = np.clip((0.095 - std_L_dom) / 0.06, 0.0, 1.0)
+    factor_plano = float(np.clip(0.72 + 0.28 * score_planitud + (0.12 if tiene_huecos else 0.0), 0.70, 1.0))
+
+    # Construir perfil de meseta plana con bisel corto en los bordes (sin abombar el centro)
+    dist = _distancia_con_bordes_cerrados(mascara_fg)
+    max_d = max(float(dist.max()), 1.0)
+    r_bisel = np.clip(dist / max(max_d * 0.14, 4.0), 0.0, 1.0)
+    meseta = np.sqrt(np.clip(2.0 * r_bisel - r_bisel * r_bisel, 0.0, 1.0)).astype(np.float32)
+
+    # Identificar pared lateral extruida y agujeros ciegos (ej. perforaciones para tornillos)
+    borde_ext = mascara_fg & (~cv2.erode(mascara_fg.astype(np.uint8), np.ones((7, 7), np.uint8)).astype(bool))
+    z_plano = meseta.copy()
+    mapa_huecos_ciegos = np.zeros_like(L, dtype=np.float32)
+
+    for cid, cnt_c in zip(ids, conteos):
+        cid = int(cid)
+        if cid == c_dom:
+            continue
+        frac_c = float(cnt_c) / float(area_fg)
+        mask_c = mascara_fg & (mapa_clusters == cid)
+        L_c = float(np.median(L[mask_c]))
+        toca_borde_ext = float((mask_c & borde_ext).sum()) / float(cnt_c + 1e-6)
+
+        if toca_borde_ext < 0.08 and L_c < L_dom - 0.05 and frac_c < 0.16:
+            # Clúster interior oscuro (agujero ciego o tornillo): hundir suavemente
+            d_c = cv2.distanceTransform(mask_c.astype(np.uint8), cv2.DIST_L2, 5).astype(np.float32)
+            if d_c.max() > 1e-3:
+                d_c /= float(d_c.max())
+            z_plano = np.where(mask_c, np.maximum(meseta * 0.65 - 0.22 * d_c, 0.18), z_plano)
+            mapa_huecos_ciegos = np.maximum(mapa_huecos_ciegos, 0.55 * d_c)
+        elif toca_borde_ext >= 0.12 and frac_c < 0.35:
+            # Pared lateral extruida en perspectiva: escalón ligeramente más bajo que la cara superior
+            z_plano = np.where(mask_c, meseta * 0.78, z_plano)
+
+    z_plano[~mascara_fg] = 0.0
+    z_plano = cv2.GaussianBlur(z_plano.astype(np.float32), (3, 3), 0)
+    if z_plano[mascara_fg].max() > 1e-6:
+        z_plano = np.where(mascara_fg, z_plano / float(z_plano[mascara_fg].max()), 0.0).astype(np.float32)
+
+    if mapa_huecos_ciegos.max() > 0.10:
+        mapa_huecos_ciegos = cv2.GaussianBlur(mapa_huecos_ciegos, (5, 5), 0)
+    else:
+        mapa_huecos_ciegos = None
+
+    return factor_plano, z_plano, mapa_huecos_ciegos
+
+
 def _profundidad_volumetrica_objeto(
     img_rgb: np.ndarray,
     img_lab: np.ndarray,
@@ -322,19 +731,32 @@ def _profundidad_volumetrica_objeto(
     mapa_clusters: np.ndarray,
     slic_map: np.ndarray | None = None,
     anat_retrato: dict | None = None,
+    info_objeto: dict | None = None,
 ) -> np.ndarray:
     """
     Reconstruye el volumen 3D de cualquier objeto aislado:
       - Si anat_retrato indica que es un rostro/persona, aplica el modelo anatómico 3D.
-      - Para vehículos, frutas, animales o productos:
+      - Para vehículos, jarrones, frutas, animales o productos:
           * Combina Transformada de Distancia con bordes cerrados + radio relativo al eje medial
-            (esqueleto local) para que tanto el cuerpo principal como partes estrechas (hojas, tallos,
-            alerones, extremidades) tengan volumen 3D proporcionado.
+            (esqueleto local) + perfil cilíndrico de revolución en objetos simétricos para dar
+            volumen real a cuerpos redondos y cuellos.
           * Sombreado intrínseco invariante al albedo (vidrios oscuros, llantas negras o sombras
             internas NO crean huecos; brillos blancos NO crean picos).
     """
     if anat_retrato is not None and anat_retrato.get("es_retrato", False):
         return _profundidad_anatomica_retrato(img_rgb, img_lab, mascara_fg, anat_retrato)
+
+    # Verificar si se trata de una pieza rígida de caras planas extruidas (ej. pieza mecánica/placa)
+    factor_plano, z_plano, mapa_huecos_ciegos = _detectar_objeto_plano_extruido(
+        img_lab, grad_map, mascara_fg, mapa_clusters
+    )
+    if info_objeto is not None:
+        info_objeto["factor_plano"] = factor_plano
+        info_objeto["mapa_huecos_ciegos"] = mapa_huecos_ciegos
+    if factor_plano >= 0.70 and z_plano is not None:
+        relieve_suave = _sombreado_intrinseco_invariante_albedo(img_lab, amplitud=0.020)
+        z_out = np.where(mascara_fg, np.clip(z_plano + relieve_suave, 0.14, 1.0), 0.0).astype(np.float32)
+        return z_out
 
     H, W = mascara_fg.shape
     dist = _distancia_con_bordes_cerrados(mascara_fg)
@@ -357,17 +779,26 @@ def _profundidad_volumetrica_objeto(
     if domo_base[mascara_fg].max() > 1e-6:
         domo_base /= float(domo_base[mascara_fg].max())
 
-    # B. Rampa suave de perspectiva 3D (solo significativa en objetos horizontales apoyados como automóviles)
+    # A2. Perfil cilíndrico de revolución para objetos simétricos (jarrones, botellas, tazas, etc.)
     ys_fg, xs_fg = np.where(mascara_fg)
     y_min, y_max = int(ys_fg.min()), int(ys_fg.max())
     x_min, x_max = int(xs_fg.min()), int(xs_fg.max())
     alto_obj = max(y_max - y_min, 1)
     ancho_obj = max(x_max - x_min, 1)
 
+    perfil_rev, simetria_lr = _perfil_revolucion_objeto(mascara_fg)
+    if simetria_lr > 0.65 and alto_obj >= 0.72 * ancho_obj:
+        peso_rev = float(np.clip((simetria_lr - 0.65) / 0.25, 0.0, 1.0)) * 0.58
+        domo_base = (1.0 - peso_rev) * domo_base + peso_rev * perfil_rev
+        if domo_base[mascara_fg].max() > 1e-6:
+            domo_base /= float(domo_base[mascara_fg].max())
+
+    # B. Rampa de perspectiva 3D y perfil estructurado (ej. vehículos/objetos horizontales en vista 3/4)
     hay_col = mascara_fg.any(axis=0)
     fila_inf_col = H - 1 - np.argmax(mascara_fg[::-1, :], axis=0)
     cols_validas = np.where(hay_col)[0]
-    if len(cols_validas) > 5 and ancho_obj > 1.10 * alto_obj:
+    es_horizontal_34 = False
+    if len(cols_validas) > 5 and ancho_obj > 1.15 * alto_obj:
         y_base_col = np.interp(
             np.arange(W),
             cols_validas,
@@ -375,18 +806,35 @@ def _profundidad_volumetrica_objeto(
         )
         y_base_col = cv2.GaussianBlur(y_base_col.reshape(1, W), (1, 41), 0).ravel()
         b_min, b_max = float(y_base_col[cols_validas].min()), float(y_base_col[cols_validas].max())
-        if b_max - b_min > 0.06 * alto_obj:
+        pendiente_base = (b_max - b_min) / float(alto_obj)
+        if pendiente_base > 0.06:
             persp_x = np.clip((y_base_col - b_min) / (b_max - b_min + 1e-6), 0.0, 1.0)
         else:
             persp_x = np.full(W, 0.5, dtype=np.float32)
         grid_y, _ = np.mgrid[0:H, 0:W]
         rel_y = np.clip((grid_y - y_min) / float(alto_obj), 0.0, 1.0)
-        rampa_perspectiva = 0.55 * persp_x[None, :] + 0.45 * (1.0 - 0.30 * (1.0 - rel_y))
+        rampa_perspectiva = 0.62 * persp_x[None, :] + 0.38 * (1.0 - 0.35 * (1.0 - rel_y))
         rampa_perspectiva = cv2.GaussianBlur(rampa_perspectiva.astype(np.float32), (21, 21), 0)
-        peso_rampa = 0.16
+
+        # En objetos horizontales en perspectiva 3/4 (autos, camionetas, muebles), aplanar ligeramente
+        # la cúspide del domo para evitar que las puertas/costados se abomben como un globo
+        if ancho_obj > 1.25 * alto_obj and simetria_lr < 0.72 and pendiente_base > 0.08:
+            es_horizontal_34 = True
+            r_caja = np.clip(r_global / 0.48, 0.0, 1.0)
+            perfil_caja = np.sqrt(np.clip(2.0 * r_caja - r_caja * r_caja, 0.0, 1.0))
+            perfil_caja = cv2.GaussianBlur(perfil_caja.astype(np.float32), (7, 7), 0)
+            domo_base = 0.42 * domo_base + 0.58 * (0.65 * perfil_caja + 0.35 * domo_local)
+            if domo_base[mascara_fg].max() > 1e-6:
+                domo_base /= float(domo_base[mascara_fg].max())
+            peso_rampa = 0.28
+        else:
+            peso_rampa = 0.16
     else:
         rampa_perspectiva = np.full((H, W), 0.5, dtype=np.float32)
         peso_rampa = 0.0
+
+    if info_objeto is not None:
+        info_objeto["es_horizontal_34"] = es_horizontal_34
 
     # C. Micro-relieve intrínseco invariante al albedo (da relieve a semillas, faros, parrillas y pliegues sin hundir colores oscuros)
     relieve_intrinseco = _sombreado_intrinseco_invariante_albedo(img_lab, amplitud=0.065)
@@ -489,8 +937,19 @@ def _profundidad_escena_universal(
     )
     es_estructura = cv2.morphologyEx(
         es_estructura.astype(np.uint8), cv2.MORPH_CLOSE,
-        cv2.getStructuringElement(cv2.MORPH_RECT, (11, 19))
+        cv2.getStructuringElement(cv2.MORPH_RECT, (15, 35) if tipo_escena == "arquitectura" else (11, 19))
     ) > 0
+    if tipo_escena == "arquitectura":
+        # En fachadas arquitectónicas, las ventanas oscuras y muros lisos forman parte de un mismo
+        # plano vertical continuo desde el techo hasta la base (sin escalones en el horizonte)
+        es_estructura = ndi.binary_fill_holes(es_estructura)
+        # Propagar hacia abajo cualquier columna con fachada sobre el horizonte hasta la zona de suelo
+        tiene_techo = (es_estructura & (y_norm < y_h_efectivo + 0.04)).any(axis=0)
+        if tiene_techo.any():
+            for x_col in np.where(tiene_techo)[0]:
+                ys_c = np.where(es_estructura[:, x_col])[0]
+                if len(ys_c) >= 2:
+                    es_estructura[ys_c[0]:ys_c[-1] + 1, x_col] = True
     es_estructura &= (~es_cielo)
 
     base_valida = es_estructura & (y_norm >= y_h_efectivo - 0.02)
@@ -520,14 +979,21 @@ def _profundidad_escena_universal(
         relieve_intrinseco
     )
     if es_estructura.any():
-        peso_est = 0.80 if tipo_escena == "arquitectura" else 0.65
+        peso_est = 0.88 if tipo_escena == "arquitectura" else 0.65
         z_est_completo = np.clip(z_prop + relieve_intrinseco, 0.08, 1.0)
-        z[es_estructura] = (
-            (1.0 - peso_est) * z[es_estructura] +
-            peso_est * np.maximum(z_est_completo[es_estructura], z[es_estructura])
-        )
+        if tipo_escena == "arquitectura":
+            # Mantener la fachada arquitectónica como un plano vertical rígido y coherente
+            z[es_estructura] = (
+                (1.0 - peso_est) * z[es_estructura] +
+                peso_est * z_est_completo[es_estructura]
+            )
+        else:
+            z[es_estructura] = (
+                (1.0 - peso_est) * z[es_estructura] +
+                peso_est * np.maximum(z_est_completo[es_estructura], z[es_estructura])
+            )
 
-    if mascara_sujeto is not None:
+    if mascara_sujeto is not None and tipo_escena != "arquitectura":
         frac_s = float(mascara_sujeto.mean())
         if 0.03 <= frac_s <= 0.78:
             dist_s = _distancia_con_bordes_cerrados(mascara_sujeto)
@@ -555,10 +1021,6 @@ def agrupar_e_inferir_profundidad(
     w_espacial: float = 0.30,
     w_color: float = 2.3,
     w_grad: float = 1.2,
-    disp_neural: np.ndarray | None = None,
-    peso_suelo: float = 0.35,
-    peso_vertical: float = 0.85,
-    conf_min_perspectiva: float = 0.35,
 ):
     H, W = slic_map.shape
     y_h = info_escena["y_horizonte"]
@@ -588,55 +1050,55 @@ def agrupar_e_inferir_profundidad(
     x_norm = (grid_x / float(W)).astype(np.float32)
 
     usa_suelo = False
-    if disp_neural is not None:
-        modo = "neural"
-        d = filtro_guiado_rapido(img_rgb, disp_neural, radio=4, eps=1e-3)
-        d = np.clip(d, 0.0, 1.0)
-        es_cielo = _mascara_cielo(img_lab, enfoque, y_norm, y_h, d)
-        d[es_cielo] = 0.0
-
-        if mascara_fg is None and vp_conf >= conf_min_perspectiva:
-            g = _prior_suelo(H, W, y_h)
-            zona = (y_norm > max(y_h + 0.10, 0.6)) & (~es_cielo)
-            a, b, _ = _ajuste_robusto(g[zona][::7], d[zona][::7])
-            if a > 0.05:
-                g_al = np.clip(a * g + b, 0.0, 1.0)
-                es_suelo = (y_norm > y_h) & (np.abs(d - g_al) < 0.08) & (~es_cielo)
-                es_suelo = cv2.morphologyEx(
-                    es_suelo.astype(np.uint8), cv2.MORPH_OPEN, np.ones((5, 5), np.uint8)
-                ) > 0
-                d = np.where(es_suelo, d + peso_suelo * (g_al - d), d)
-                d = _anclar_verticales_al_suelo(d, es_suelo, es_cielo, peso_vertical)
-                usa_suelo = True
-        if mascara_fg is not None:
-            z_domo = _profundidad_volumetrica_objeto(
-                img_rgb, img_lab, enfoque, grad_map, mascara_fg, mapa_clusters, slic_map, anat_retrato
-            )
-            d = np.where(mascara_fg, 0.50 * d + 0.50 * z_domo, 0.0)
-        mapa_geom = d
+    mapa_cavidad = None
+    mapa_realce = None
+    info_objeto: dict = {"factor_plano": 0.0, "mapa_huecos_ciegos": None}
+    modo = f"no supervisado ({tipo_escena})"
+    if mascara_fg is not None:
+        es_cielo = ~mascara_fg
+        mapa_geom = _profundidad_volumetrica_objeto(
+            img_rgb, img_lab, enfoque, grad_map, mascara_fg, mapa_clusters, slic_map, anat_retrato,
+            info_objeto=info_objeto,
+        )
+        if info_objeto.get("mapa_huecos_ciegos") is not None:
+            mapa_cavidad = info_objeto["mapa_huecos_ciegos"]
+        elif tipo_escena != "retrato" and info_objeto.get("factor_plano", 0.0) < 0.5:
+            cav = _detectar_cavidad_superior(img_lab, grad_map, mascara_fg)
+            if float(cav.max()) > 0.15:
+                mapa_cavidad = cav
+            elif not info_objeto.get("es_horizontal_34", False):
+                realce_boq, cav_boq = _detectar_boquilla_frontal(img_lab, grad_map, mascara_fg)
+                if realce_boq is not None and cav_boq is not None:
+                    # Escalar levemente el cuerpo base para que el collarín de la boquilla sobresalga con claridad
+                    mapa_geom = np.where(
+                        mascara_fg,
+                        np.clip(0.76 * mapa_geom + 0.34 * realce_boq, 0.14, 1.0),
+                        0.0,
+                    ).astype(np.float32)
+                    mapa_realce = realce_boq
+                    mapa_cavidad = cav_boq
     else:
-        modo = f"universal ({tipo_escena})"
-        if mascara_fg is not None:
-            es_cielo = ~mascara_fg
-            mapa_geom = _profundidad_volumetrica_objeto(
-                img_rgb, img_lab, enfoque, grad_map, mascara_fg, mapa_clusters, slic_map, anat_retrato
-            )
-        else:
-            es_cielo = _mascara_cielo(img_lab, enfoque, y_norm, y_h)
-            usa_suelo = True
-            mapa_geom = _profundidad_escena_universal(
-                img_rgb, img_lab, enfoque, grad_map, y_norm, x_norm,
-                y_h, x_vp, es_cielo, vp_conf, tipo_escena,
-                slic_map=slic_map, hipervectores=hipervectores,
-                mascara_sujeto=mascara_sujeto_escena,
-                anat_retrato=anat_retrato,
-            )
+        es_cielo = _mascara_cielo(img_lab, enfoque, y_norm, y_h)
+        usa_suelo = True
+        mapa_geom = _profundidad_escena_universal(
+            img_rgb, img_lab, enfoque, grad_map, y_norm, x_norm,
+            y_h, x_vp, es_cielo, vp_conf, tipo_escena,
+            slic_map=slic_map, hipervectores=hipervectores,
+            mascara_sujeto=mascara_sujeto_escena,
+            anat_retrato=anat_retrato,
+        )
+
+    factor_plano = float(info_objeto.get("factor_plano", 0.0))
+    info_escena["mapa_cavidad"] = mapa_cavidad
+    info_escena["mapa_realce"] = mapa_realce
+    info_escena["factor_plano"] = factor_plano
+    info_escena["es_horizontal_34"] = bool(info_objeto.get("es_horizontal_34", False))
 
     # 3. Regularización por superpíxeles (Make3D) sin destruir la continuidad anatómica
     planos = _ajuste_planos_por_superpixel(mapa_geom, slic_map)
     if tipo_escena == "retrato":
         peso_planos = 0.12
-    elif tipo_escena == "arquitectura":
+    elif tipo_escena == "arquitectura" or factor_plano >= 0.70:
         peso_planos = 0.45
     else:
         peso_planos = 0.28
@@ -644,20 +1106,30 @@ def agrupar_e_inferir_profundidad(
 
     # 4. Refinamiento final de bordes SIN contaminar la profundidad con el albedo (colores oscuros/claros)
     if mascara_fg is not None:
-        # En objetos y retratos aislados, suavizamos geométricamente dentro de la máscara
-        # (NO aplicamos filtro guiado por luminancia intensa para evitar que barbas o vidrios oscuros se hundan)
-        z_suave = cv2.GaussianBlur(mapa_z_bruto, (7, 7), 0)
-        z_guiado = filtro_guiado_rapido(img_rgb, mapa_z_bruto, radio=3, eps=2e-2)
-        mapa_z_final = (0.82 * z_suave + 0.18 * z_guiado).astype(np.float32)
-        if mascara_fg.any():
-            vals = mapa_z_final[mascara_fg]
-            lo, hi = np.percentile(vals, [1, 99.5])
-            z_fg = np.clip((mapa_z_final - lo) / (hi - lo + 1e-6), 0.0, 1.0)
-            dist_borde = _distancia_con_bordes_cerrados(mascara_fg)
-            peso_borde = np.clip(dist_borde / max(float(dist_borde.max()) * 0.18, 2.5), 0.0, 1.0)
-            mapa_z_final = np.where(mascara_fg, 0.15 + 0.85 * z_fg * np.sqrt(peso_borde), 0.0).astype(np.float32)
+        if factor_plano >= 0.70:
+            # Pieza rígida/plana: preservar aristas nítidas y meseta sin abombamiento
+            z_suave = cv2.GaussianBlur(mapa_z_bruto, (3, 3), 0)
+            mapa_z_final = np.where(mascara_fg, np.clip(z_suave, 0.15, 1.0), 0.0).astype(np.float32)
         else:
-            mapa_z_final = _normalizar(mapa_z_final)
+            # En objetos curvos y retratos aislados, suavizamos geométricamente dentro de la máscara
+            z_suave = cv2.GaussianBlur(mapa_z_bruto, (7, 7), 0)
+            z_guiado = filtro_guiado_rapido(img_rgb, mapa_z_bruto, radio=3, eps=2e-2)
+            mapa_z_final = (0.82 * z_suave + 0.18 * z_guiado).astype(np.float32)
+            if mascara_fg.any():
+                vals = mapa_z_final[mascara_fg]
+                lo, hi = np.percentile(vals, [1, 99.5])
+                z_fg = np.clip((mapa_z_final - lo) / (hi - lo + 1e-6), 0.0, 1.0)
+                dist_borde = _distancia_con_bordes_cerrados(mascara_fg)
+                peso_borde = np.clip(dist_borde / max(float(dist_borde.max()) * 0.18, 2.5), 0.0, 1.0)
+                mapa_z_final = np.where(mascara_fg, 0.15 + 0.85 * z_fg * np.sqrt(peso_borde), 0.0).astype(np.float32)
+                if mapa_cavidad is not None:
+                    mapa_z_final = np.where(
+                        mascara_fg,
+                        np.clip(mapa_z_final - 0.35 * mapa_cavidad, 0.05, 1.0),
+                        0.0,
+                    ).astype(np.float32)
+            else:
+                mapa_z_final = _normalizar(mapa_z_final)
     else:
         # En escenas completas, mezclamos suavizado bilateral con filtro guiado suave de alta regularización (eps=8e-3)
         z_guiado = filtro_guiado_rapido(img_rgb, mapa_z_bruto, radio=5, eps=8e-3)
@@ -670,6 +1142,8 @@ def agrupar_e_inferir_profundidad(
         "tipo_escena": tipo_escena,
         "suelo_en_perspectiva": usa_suelo,
         "fondo_eliminado": mascara_fg is not None,
+        "objeto_plano": factor_plano >= 0.70,
+        "cavidad_detectada": mapa_cavidad is not None,
         "silueta": round(float(silueta), 4),
         "davies_bouldin": round(float(dbi), 4),
         "wcss": round(float(kmeans.inertia_), 2),
