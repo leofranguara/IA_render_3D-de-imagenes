@@ -357,3 +357,36 @@ def visualizar_y_exportar(malla: trimesh.Trimesh, ruta_obj: str = "data/modelo_3
     ctr.set_zoom(0.5)
     vis.run()
     vis.destroy_window()
+
+
+def abrir_visor_archivo(ruta_malla: str, z_pivote: float = 2.2):
+    """
+    Abre una malla ya exportada (.ply / .obj) directamente en el visor interactivo Open3D.
+    Pensado para ejecutarse en un proceso independiente y evitar conflictos con Tkinter.
+    """
+    try:
+        import open3d as o3d
+    except ImportError:
+        print("[i] open3d no está instalado: abre el .ply/.glb en MeshLab o Blender.")
+        return
+
+    m = o3d.io.read_triangle_mesh(ruta_malla)
+    if not m.has_vertices():
+        print(f"[Error] No se pudo cargar la malla en: {ruta_malla}")
+        return
+    m.compute_vertex_normals()
+
+    vis = o3d.visualization.Visualizer()
+    vis.create_window(window_name="Reconstrucción 3D desde una imagen", width=1200, height=820)
+    vis.add_geometry(m)
+    opt = vis.get_render_option()
+    opt.background_color = np.asarray([0.11, 0.11, 0.13])
+    opt.mesh_show_back_face = True
+    opt.light_on = False
+    ctr = vis.get_view_control()
+    ctr.set_lookat([0.0, 0.0, -float(z_pivote)])
+    ctr.set_front([0.0, 0.0, 1.0])
+    ctr.set_up([0.0, 1.0, 0.0])
+    ctr.set_zoom(0.5)
+    vis.run()
+    vis.destroy_window()

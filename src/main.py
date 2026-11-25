@@ -6,6 +6,8 @@ Uso (desde la carpeta raíz del proyecto):
 """
 import argparse
 import os
+import subprocess
+import sys
 import threading
 import time
 
@@ -22,7 +24,7 @@ from fase1_slic import (
     segmentar_objeto_sin_fondo,
 )
 from fase2_clustering_profundidad import agrupar_e_inferir_profundidad
-from fase3_malla_3d import construir_malla_volumetrica, guardar_vistas, visualizar_y_exportar
+from fase3_malla_3d import abrir_visor_archivo, construir_malla_volumetrica, guardar_vistas, visualizar_y_exportar
 
 
 def generar_imagen_slic(img_rgb: np.ndarray, slic_map: np.ndarray, mascara_fg=None) -> np.ndarray:
@@ -699,11 +701,12 @@ def abrir_menu_principal(args_iniciales):
                                 f"Resultado 3D: Vistas Multi-ángulo (Grosor Espejo: {int(var_grosor_espejo.get() * 100)}%)",
                             )
                     if var_abrir_visor.get():
-                        threading.Thread(
-                            target=visualizar_y_exportar,
-                            args=(res["malla"], res["ruta_obj"], True),
-                            daemon=True,
-                        ).start()
+                        ruta_ply = os.path.splitext(res["ruta_obj"])[0] + ".ply"
+                        ruta_vis = ruta_ply if os.path.exists(ruta_ply) else res["ruta_obj"]
+                        zp = float(res["malla"].metadata.get("z_pivote", 2.2))
+                        subprocess.Popen(
+                            [sys.executable, os.path.abspath(__file__), "--solo-visor", ruta_vis, "--z-pivote", str(zp)]
+                        )
 
                 root.after(0, al_terminar)
             except Exception as e:
@@ -717,7 +720,10 @@ def abrir_menu_principal(args_iniciales):
 
     btn_generar.config(command=iniciar_generacion)
     root.after(150, actualizar_vista_previa)
-    root.mainloop()
+    try:
+        root.mainloop()
+    except KeyboardInterrupt:
+        pass
 
 
 def main():
@@ -739,7 +745,13 @@ def main():
                     help="Factor de grosor al duplicar en espejo (ej. 0.25 = muy delgado, 0.45 = delgado, 0.65 = equilibrado, 1.0 = normal)")
     ap.add_argument("--sin-visor", action="store_true", help="No abrir la ventana de Open3D al finalizar")
     ap.add_argument("--sin-menu", action="store_true", help="Ejecutar directamente por consola sin abrir el menú principal")
+    ap.add_argument("--solo-visor", default="", help=argparse.SUPPRESS)
+    ap.add_argument("--z-pivote", type=float, default=2.2, help=argparse.SUPPRESS)
     args = ap.parse_args()
+
+    if args.solo_visor:
+        abrir_visor_archivo(args.solo_visor, z_pivote=args.z_pivote)
+        return
 
     if args.quitar_fondo:
         args.fondo = "quitar"
